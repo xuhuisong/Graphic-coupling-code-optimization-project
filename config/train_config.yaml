@@ -1,0 +1,96 @@
+# =====================================================
+# 统一训练配置文件
+# =====================================================
+
+# 基本配置
+exp_name: refactored_experiment
+split_seed: 1449
+seed: 909
+
+# 数据配置
+data:
+  data_dir: ADvsCN.ex001_2_p288
+  data_name: ADvsCN.ex001_2_p288_pw24_all
+  patch_size: 24
+  num_folds: 5
+
+# 缓存管理配置
+cache:
+  base_dir: ./cache
+  auto_clean: false  # 是否自动清理旧缓存
+
+# DenseNet预训练配置
+densenet:
+  pretrain:
+    num_epochs: 50
+    stage1_epochs: 49       # 阶段1轮数（无mask）
+    mask_ratio: 0.3         # 阶段2的mask比例
+    batch_size: 16
+    learning_rate_stage1: 0.0001
+    learning_rate_stage2: 0.0004
+    weight_decay_stage1: 0.0001
+    weight_decay_stage2: 0.00001
+    num_workers: 4
+  model:
+    growth_rate: 8
+    num_init_features: 24
+
+# 图边构建配置
+graph:
+  build:
+    similarity_threshold: 0.7    # patch间相似度阈值
+    frequency_threshold: 0.3     # 边在患者中的最小出现频率
+    similarity_metric: cosine    # 相似度计算方式: cosine, euclidean
+    batch_size: 64              # 相似度计算批次大小
+    use_all_data: true          # 使用全部数据构建边（推荐）
+  params:
+    node_type: px
+    edge_type: abscorr
+    dist_type: euc_1+gau
+    adj_norm: DAD
+
+# 主训练配置
+train:
+  folds: [0, 1, 2, 3, 4]        # 要训练的fold列表
+  pre_epoch: 40
+  num_epoch: 140
+  stage_transition_epoch: 80
+  batch_size: 33
+  test_batch_size: 33
+  
+  # 优化器
+  optimizer: SGD
+  base_lr: 0.0001
+  base_lr_mask: 4
+  weight_decay: 0.0005
+  nesterov: true
+  scheduler: auto
+  stepsize: 10
+  gamma: 0.5
+  
+  # 损失权重
+  loss_weights:
+    LC: 1      # 因果损失
+    LO: 1      # 反事实损失
+    LCI: 1     # 不变性损失
+    LCV: 1     # 变异性损失
+    LG: 0.002  # 引导损失
+    lambda_l1: 0.0001  # L1正则化
+
+# 模型配置
+model:
+  name: net.networks
+  args:
+    hidden1: [28]
+    kernels: [2]
+    hidden2: [28, 28]
+    freeze_extractor: true
+
+# 其他配置
+misc:
+  device: [0]          # GPU设备索引
+  gumble_tau: 1
+  log_interval: 100
+  save_interval: 5
+  eval_interval: 5
+  print_log: true
