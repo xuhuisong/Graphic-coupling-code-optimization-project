@@ -302,44 +302,5 @@ def main():
     logger.info("🎉 所有任务完成！优雅地结束！")
     logger.info("="*80)
 
-
-if __name__ == "__main__":
-    main()
-    logger.info("\n" + "="*80)
-    logger.info("训练完成！汇总结果：")
-    logger.info("="*80)
-    
-    import numpy as np
-    
-    val_accs = [r['val_acc'] for r in all_results]
-    test_accs = [r['test_acc'] for r in all_results]
-    
-    logger.info(f"\n验证集准确率: {val_accs}")
-    logger.info(f"  平均: {np.mean(val_accs):.4f} ± {np.std(val_accs):.4f}")
-    
-    logger.info(f"\n测试集准确率: {test_accs}")
-    logger.info(f"  平均: {np.mean(test_accs):.4f} ± {np.std(test_accs):.4f}")
-    
-    # 7. 保存结果
-    import json
-    results_file = exp_dir / 'results' / 'final_results.json'
-    with open(results_file, 'w') as f:
-        json.dump({
-            'config': config,
-            'fold_results': all_results,
-            'summary': {
-                'val_acc_mean': float(np.mean(val_accs)),
-                'val_acc_std': float(np.std(val_accs)),
-                'test_acc_mean': float(np.mean(test_accs)),
-                'test_acc_std': float(np.std(test_accs))
-            }
-        }, f, indent=2)
-    
-    logger.info(f"\n✅ 结果已保存到: {results_file}")
-    logger.info("\n" + "="*80)
-    logger.info("所有任务完成！")
-    logger.info("="*80)
-
-
 if __name__ == "__main__":
     main()

@@ -114,12 +114,16 @@ class CausalNet(nn.Module):
         feature_dim: int,
         hidden1: list,
         hidden2: list,
-        kernels: Optional[list] = None
+        num_patches: int,
+        kernels: Optional[list] = None,
+        num_neg_samples=4
     ):
         super(CausalNet, self).__init__()
         
+        self.num_neg_samples = num_neg_samples
         self.num_class = num_class
         self.feature_dim = feature_dim
+        self.num_patches = num_patches
         self.hidden1 = hidden1
         self.hidden2 = hidden2
         
@@ -132,7 +136,7 @@ class CausalNet(nn.Module):
         
         # 因果MLP
         self.mlp_causal = nn.Sequential(
-            nn.Linear(hidden2[-1] * 288, 128),  # 假设288个patch
+            nn.Linear(hidden2[-1] * num_patches, 128),  # 假设288个patch
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(128, num_class)
@@ -140,7 +144,7 @@ class CausalNet(nn.Module):
         
         # 整体预测MLP（用于预训练）
         self.mlp_whole = nn.Sequential(
-            nn.Linear(feature_dim * 288, 256),
+            nn.Linear(feature_dim * num_patches, 256),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, 128),
@@ -192,7 +196,7 @@ class CausalNet(nn.Module):
         if is_large_graph:
             # 大图模式
             batch_size = x_new.shape[0]
-            P = x_new.shape[1] // 5
+            P = x_new.shape[1] // (self.num_neg_samples + 1)
             x_orig = x_new[:, :P, :].clone()
             #print(f"边矩阵形状：{edge.shape},P的大小：{P}")
             edge_orig = edge[:, :P, :P].clone()
@@ -240,7 +244,7 @@ class CausalNet(nn.Module):
         
         if is_large_graph:
             batch_size = x_new.shape[0]
-            P = x_new.shape[1] // 5
+            P = x_new.shape[1] // (self.num_neg_samples + 1)
             x_orig = x_new[:, :P, :].clone()
             edge_orig = edge[:, :P, :P].clone()
             

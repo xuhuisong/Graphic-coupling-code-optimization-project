@@ -76,10 +76,10 @@ class CausalTrainer:
         self.epoch_results = {}
         self.current_mask_sums = {}
         self.large_graph_builder = LargeGraphBuilder(
-        num_neg_samples=4,
-        sampling_strategy='opposite_label',
-        random_seed=config['seed']
-    )
+            num_neg_samples=config['large_graph']['num_neg_samples'],
+            sampling_strategy=config['large_graph']['sampling_strategy'],
+            random_seed=config['seed']
+        )
         self.all_data = None
         self.all_labels = None        
         
@@ -97,7 +97,9 @@ class CausalTrainer:
             feature_dim=self.densenet_model.feature_dim,
             hidden1=self.config['model']['args']['hidden1'],
             hidden2=self.config['model']['args']['hidden2'],
-            kernels=self.config['model']['args'].get('kernels', [2])
+            kernels=self.config['model']['args'].get('kernels', [2]),
+            num_patches=self.edge_matrix.shape[0],
+            num_neg_samples=self.config['large_graph']['num_neg_samples']
         ).to(self.device)
         
         # 因果掩码模型
