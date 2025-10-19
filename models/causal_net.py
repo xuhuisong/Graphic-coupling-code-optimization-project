@@ -62,7 +62,6 @@ class TwoStageGCN(nn.Module):
         x = F.relu(self.stage1_bn1(x.transpose(1, 2)).transpose(1, 2))
         
         # ========== 第一阶段第二层 ==========
-        # 修改：继续使用边矩阵而非单位矩阵
         x = self.stage1_conv2(x, edge1_norm)  # ← 关键修改
         x = F.relu(self.stage1_bn2(x.transpose(1, 2)).transpose(1, 2))
         
@@ -76,31 +75,37 @@ class TwoStageGCN(nn.Module):
     @staticmethod
     def _normalize_adj_batch(adj: torch.Tensor) -> torch.Tensor:
         """
-        对称归一化邻接矩阵（batch版本）
-        D^{-1/2} * (A + I) * D^{-1/2}
-        
+        对称归一化邻接矩阵
+
         Args:
             adj: [B, P, P] 邻接矩阵
         Returns:
             [B, P, P] 归一化后的邻接矩阵
         """
-        # 1. 添加自环
-        identity = torch.eye(adj.size(1), device=adj.device).unsqueeze(0)
+        # 1. 强制清空对角线（移除任何已有的自环）
+        batch_size, num_nodes = adj.shape[0], adj.shape[1]
+        adj = adj.clone()  # 避免修改原始输入
+
+        # 将对角线设为0
+        diag_indices = torch.arange(num_nodes, device=adj.device)
+        adj[:, diag_indices, diag_indices] = 0
+
+        # 2. 添加自环（统一权重为1）
+        identity = torch.eye(num_nodes, device=adj.device).unsqueeze(0)
         adj_with_self_loops = adj + identity
-        
-        # 2. 计算度矩阵
+
+        # 3. 计算度
         degree = adj_with_self_loops.sum(dim=2)  # [B, P]
-        
-        # 3. 计算 D^{-1/2}
+
+        # 4. D^{-1/2}
         degree_inv_sqrt = torch.pow(degree, -0.5)
-        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0  # 处理孤立节点（度为0）
-        
-        # 4. 对称归一化: D^{-1/2} * A * D^{-1/2}
-        # 使用广播: [B, P, 1] * [B, P, P] * [B, 1, P]
+        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0  # 处理孤立节点
+
+        # 5. 对称归一化: D^{-1/2} * A * D^{-1/2}
         adj_normalized = (degree_inv_sqrt.unsqueeze(2) * 
                          adj_with_self_loops * 
                          degree_inv_sqrt.unsqueeze(1))
-        
+
         return adj_normalized
 
 
@@ -202,12 +207,8 @@ class CausalNet(nn.Module):
             x_masked = x_orig * node_mask.unsqueeze(0).unsqueeze(-1)
             inter_node_adj = edge_orig * edge_mask.unsqueeze(0)
             
-            # 添加自环
-            identity = torch.eye(P, device=inter_node_adj.device).unsqueeze(0)
-            final_adj = inter_node_adj + identity
-            
             # GCN
-            xs = self.gcns2_causal(x_masked, final_adj)
+            xs = self.gcns2_causal(x_masked, inter_node_adj)
         else:
             # 小图模式
             x_masked = x_new * node_mask.unsqueeze(0).unsqueeze(-1)
@@ -215,10 +216,8 @@ class CausalNet(nn.Module):
             inter_node_adj = edge * edge_mask.unsqueeze(0)
             
             P = x_new.shape[1]
-            identity = torch.eye(P, device=edge.device).unsqueeze(0)
-            final_adj = inter_node_adj + identity
             
-            xs = self.gcns2_causal(x_masked, final_adj)
+            xs = self.gcns2_causal(x_masked, inter_node_adj)
         
         graph = readout(xs)
         return self.mlp_causal(graph)
@@ -248,10 +247,8 @@ class CausalNet(nn.Module):
         edge_perturbed = edge * (1 - causal_edge_mask)
             
         P = x_new.shape[1]
-        identity = torch.eye(P, device=edge_perturbed.device).unsqueeze(0)
-        final_adj_perturbed = edge_perturbed + identity
             
-        xs = self.gcns2_causal(x_perturbed, final_adj_perturbed)
+        xs = self.gcns2_causal(x_perturbed, edge_perturbed)
         
         graph = readout(xs)
         return self.mlp_causal(graph)
@@ -301,9 +298,6 @@ class CausalNet(nn.Module):
                 
                 orig_edge_block = edge[i, :P, :P]
                 internal_edges[i, start:end, start:end] = orig_edge_block * edge_mask_spur
-        
-        identity_large = torch.eye(large_P, device=edge.device).unsqueeze(0)
-        internal_edges = internal_edges + identity_large
         
         # 3. Cross edges: 跨样本spurious节点全连接
         cross_edges = torch.zeros_like(edge).to(edge.device)
@@ -378,9 +372,6 @@ class CausalNet(nn.Module):
                 
                 orig_edge_block = edge[i, :P, :P]
                 internal_edges[i, start:end, start:end] = orig_edge_block * edge_mask
-        
-        identity_large = torch.eye(large_P, device=edge.device).unsqueeze(0)
-        internal_edges = internal_edges + identity_large
         
         # 3. Cross edges: 跨样本intrinsic节点全连接
         cross_edges = torch.zeros_like(edge).to(edge.device)
