@@ -29,8 +29,8 @@ class CausalTrainer:
     
     三阶段训练流程：
     1. 预训练：训练整体预测 (40 epochs)
-    2. 阶段1：Mask+GNN联合训练（不变性+变异性） (40 epochs)
-    3. 阶段2：Mask+GNN联合训练（因果性+反事实） (60 epochs)
+    2. 阶段1：Mask+GNN联合训练（内在子图+虚假子图） (40 epochs)
+    3. 阶段2：Mask+GNN联合训练（虚假子图干扰性+内在子图干扰） (60 epochs)
     """
     
     def __init__(
@@ -289,7 +289,7 @@ class CausalTrainer:
         if self.rank == 0:
             self.epoch_results[epoch]['train'] = {
                 'loss_all': np.mean(losses),
-                'acc_invariance': np.mean(accuracies)
+                'acc_Intrinsic': np.mean(accuracies)
             }
     
     def _eval_pretrain_epoch(self, epoch: int, data_loader: DataLoader, phase: str):
@@ -377,16 +377,16 @@ class CausalTrainer:
         # ✅ 修复1：损失记录器始终初始化
         losses_mask = {
             'all': [], 
-            'invariance': [], 
-            'variability': [], 
-            'causal': [], 
-            'counterfactual': [], 
+            'Intrinsic': [], 
+            'Spurious': [], 
+            'spurious_fusion': [], 
+            'intrinsic_fusion': [], 
             'sparsity_reg': []
         }
         losses_gnn = {
             'all': [], 
-            'invariance': [], 
-            'causal': [], 
+            'Intrinsic': [], 
+            'spurious_fusion': [], 
             'l1_reg': []
         }
         accs_mask = {}
@@ -432,14 +432,14 @@ class CausalTrainer:
 
             # ✅ 修复2：立即记录损失（不管 rank）
             losses_mask['all'].append(result_mask['loss']['all'].item())
-            if 'invariance' in result_mask['loss']:
-                losses_mask['invariance'].append(result_mask['loss']['invariance'].item())
-            if 'variability' in result_mask['loss']:
-                losses_mask['variability'].append(result_mask['loss']['variability'].item())
-            if 'causal' in result_mask['loss']:
-                losses_mask['causal'].append(result_mask['loss']['causal'].item())
-            if 'counterfactual' in result_mask['loss']:
-                losses_mask['counterfactual'].append(result_mask['loss']['counterfactual'].item())
+            if 'Intrinsic' in result_mask['loss']:
+                losses_mask['Intrinsic'].append(result_mask['loss']['Intrinsic'].item())
+            if 'Spurious' in result_mask['loss']:
+                losses_mask['Spurious'].append(result_mask['loss']['Spurious'].item())
+            if 'spurious_fusion' in result_mask['loss']:
+                losses_mask['spurious_fusion'].append(result_mask['loss']['spurious_fusion'].item())
+            if 'intrinsic_fusion' in result_mask['loss']:
+                losses_mask['intrinsic_fusion'].append(result_mask['loss']['intrinsic_fusion'].item())
             if 'sparsity_reg' in result_mask['loss']:
                 losses_mask['sparsity_reg'].append(result_mask['loss']['sparsity_reg'].item())
 
@@ -469,10 +469,10 @@ class CausalTrainer:
 
             # ✅ 修复3：立即记录损失（不管 rank）
             losses_gnn['all'].append(result_gnn['loss']['all'].item())
-            if 'invariance' in result_gnn['loss']:
-                losses_gnn['invariance'].append(result_gnn['loss']['invariance'].item())
-            if 'causal' in result_gnn['loss']:
-                losses_gnn['causal'].append(result_gnn['loss']['causal'].item())
+            if 'Intrinsic' in result_gnn['loss']:
+                losses_gnn['Intrinsic'].append(result_gnn['loss']['Intrinsic'].item())
+            if 'spurious_fusion' in result_gnn['loss']:
+                losses_gnn['spurious_fusion'].append(result_gnn['loss']['spurious_fusion'].item())
             if 'l1_reg' in result_gnn['loss']:
                 losses_gnn['l1_reg'].append(result_gnn['loss']['l1_reg'].item())
 
@@ -548,7 +548,7 @@ class CausalTrainer:
             # 评估时使用小图
             B, P = batch_data.shape[0], batch_data.shape[1]
             small_edge = self.edge_matrix.unsqueeze(0).repeat(B, 1, 1)
-            outputs = model_module.prediction_causal_invariance(x_features, small_edge, masks, is_large_graph=False)
+            outputs = model_module.prediction_intrinsic_path(x_features, small_edge, masks, is_large_graph=False)
 
             all_outputs.append(outputs)
             all_labels.append(label)
@@ -583,15 +583,15 @@ class CausalTrainer:
     #==================== 损失计算 ====================
     
     def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg, edge):
-        """阶段1 Mask损失：不变性 + 变异性"""
+        """阶段1 Mask损失：内在子图 + 虚假子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        # 不变性
-        yci = model.prediction_causal_invariance(x, edge, masks, True)
+        # 内在子图
+        yci = model.prediction_intrinsic_path(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
-        # 变异性（熵损失）
-        ycv = model.prediction_causal_variability(x, edge, masks, True)
+        # 虚假子图（熵损失）
+        ycv = model.prediction_spurious_path(x, edge, masks, True)
         loss_cv = self._entropy_loss(ycv)
         
         # 稀疏性正则
@@ -605,29 +605,29 @@ class CausalTrainer:
         return {
             'loss': {
                 'all': loss_all,
-                'invariance': loss_ci,
-                'variability': loss_cv,
+                'Intrinsic': loss_ci,
+                'Spurious': loss_cv,
                 'sparsity_reg': reg_loss
             },
             'preds': {
-                'invariance': yci,
-                'variability': ycv
+                'Intrinsic': yci,
+                'Spurious': ycv
             }
         }
     
     def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg, edge):
-        """阶段2 Mask损失：因果 + 反事实 + 不变性"""
+        """阶段2 Mask损失：虚假子图干扰 + 内在子图干扰 + 内在子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        # 不变性
-        yci = model.prediction_causal_invariance(x, edge, masks, True)
+        # 内在子图
+        yci = model.prediction_intrinsic_path(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
-        # 因果性
+        # 虚假子图干扰性
         yc = model.prediction_spurious_fusion(x, edge, masks, True)   # 使用相同方法
         loss_c = self.criterion(yc, label).mean()
         
-        # 反事实
+        # 内在子图干扰
         yo = model.prediction_intrinsic_fusion(x, edge, masks, True)
         loss_o = self.criterion(yo, 1 - label).mean()
         
@@ -645,22 +645,22 @@ class CausalTrainer:
         return {
             'loss': {
                 'all': loss_all,
-                'causal': loss_c,
-                'counterfactual': loss_o,
-                'invariance': loss_ci,
+                'spurious_fusion': loss_c,
+                'intrinsic_fusion': loss_o,
+                'Intrinsic': loss_ci,
                 'sparsity_reg': reg_loss
             },
             'preds': {
-                'causal': yc,
-                'counterfactual': yo,
-                'invariance': yci
+                'spurious_fusion': yc,
+                'intrinsic_fusion': yo,
+                'Intrinsic': yci
             }
         }
     def _compute_stage1_gnn_loss(self, x, masks, label, edge):
-        """阶段1 GNN损失：不变性"""
+        """阶段1 GNN损失：内在子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        yci = model.prediction_causal_invariance(x, edge, masks, True)
+        yci = model.prediction_intrinsic_path(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         l1_loss = self._compute_l1_regularization()
         loss_all = loss_ci + l1_loss
@@ -668,19 +668,19 @@ class CausalTrainer:
         return {
             'loss': {
                 'all': loss_all,
-                'invariance': loss_ci,
+                'Intrinsic': loss_ci,
                 'l1_reg': l1_loss
             },
             'preds': {
-                'invariance': yci
+                'Intrinsic': yci
             }
         }
     
     def _compute_stage2_gnn_loss(self, x, masks, label, edge):
-        """阶段2 GNN损失：不变性 + 因果"""
+        """阶段2 GNN损失：内在子图 + 虚假子图干扰"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        yci = model.prediction_causal_invariance(x, edge, masks, True)
+        yci = model.prediction_intrinsic_path(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
         yc = model.prediction_spurious_fusion(x, edge, masks, True) 
@@ -692,13 +692,13 @@ class CausalTrainer:
         return {
             'loss': {
                 'all': loss_all,
-                'invariance': loss_ci,
-                'causal': loss_c,
+                'Intrinsic': loss_ci,
+                'spurious_fusion': loss_c,
                 'l1_reg': l1_loss
             },
             'preds': {
-                'invariance': yci,
-                'causal': yc
+                'Intrinsic': yci,
+                'spurious_fusion': yc
             }
         }
     
@@ -739,7 +739,7 @@ class CausalTrainer:
         return self.lambda_l1 * l1_reg
     
     def _entropy_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        """熵损失（用于变异性）"""
+        """熵损失（用于虚假子图）"""
         probs = torch.softmax(logits, dim=1)
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=1)
         return -entropy.mean()  # 负号使其最大化熵
@@ -763,7 +763,7 @@ class CausalTrainer:
         logger.info(f"📚 Epoch {epoch+1}/{self.config['train']['pre_epoch']} [Pre-train]")
         logger.info("-"*80)
         logger.info(f"Train - Loss: {train_res.get('loss_all', 0):.4f}, "
-                   f"Acc: {train_res.get('acc_invariance', 0):.4f}")
+                   f"Acc: {train_res.get('acc_Intrinsic', 0):.4f}")
 
         # ✅ 增强验证集日志
         logger.info(f"Val   - Acc: {val_res.get('accuracy', 0):.4f}, "
@@ -792,7 +792,7 @@ class CausalTrainer:
         mask_res = train_res.get('mask', {})
         gnn_res = train_res.get('gnn', {})
 
-        stage_name = "Stage 1 (Invariance+Variability)" if is_stage1 else "Stage 2 (Causal+Counterfactual)"
+        stage_name = "Stage 1 (Intrinsic+Spurious)" if is_stage1 else "Stage 2 (spurious_fusion+intrinsic_fusion)"
 
         logger.info("="*80)
         logger.info(f"🎯 Epoch {epoch+1}/{self.config['train']['num_epoch']} [{stage_name}]")
@@ -819,27 +819,27 @@ class CausalTrainer:
         logger.info(f"\n🎭 Mask Training:")
         logger.info(f"   Total Loss: {mask_res.get('all', 0):.4f}")  # ✅ 改为 'all'
         if is_stage1:
-            logger.info(f"     ├─ Invariance:  {mask_res.get('invariance', 0):.4f} "  # ✅ 改为 'invariance'
-                       f"(Acc: {mask_res.get('acc_invariance', 0):.2%})")
-            logger.info(f"     ├─ Variability: {mask_res.get('variability', 0):.4f} "  # ✅ 改为 'variability'
-                       f"(Acc: {mask_res.get('acc_variability', 0):.2%})")
+            logger.info(f"     ├─ Intrinsic:  {mask_res.get('Intrinsic', 0):.4f} "  # ✅ 改为 'Intrinsic'
+                       f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
+            logger.info(f"     ├─ Spurious: {mask_res.get('Spurious', 0):.4f} "  # ✅ 改为 'Spurious'
+                       f"(Acc: {mask_res.get('acc_Spurious', 0):.2%})")
             logger.info(f"     └─ Sparsity:    {mask_res.get('sparsity_reg', 0):.4f}")  # ✅ 改为 'sparsity_reg'
         else:
-            logger.info(f"     ├─ Invariance:     {mask_res.get('invariance', 0):.4f} "  # ✅
-                       f"(Acc: {mask_res.get('acc_invariance', 0):.2%})")
-            logger.info(f"     ├─ Causal:         {mask_res.get('causal', 0):.4f} "  # ✅ 改为 'causal'
+            logger.info(f"     ├─ Intrinsic:     {mask_res.get('Intrinsic', 0):.4f} "  # ✅
+                       f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
+            logger.info(f"     ├─ spurious_fusion:         {mask_res.get('spurious_fusion', 0):.4f} "  # ✅ 改为 'spurious_fusion'
                        f"(Acc: {mask_res.get('acc_causal', 0):.2%})")
-            logger.info(f"     ├─ Counterfactual: {mask_res.get('counterfactual', 0):.4f} "  # ✅ 改为 'counterfactual'
-                       f"(Acc: {mask_res.get('acc_counterfactual', 0):.2%})")
+            logger.info(f"     ├─ intrinsic_fusion: {mask_res.get('intrinsic_fusion', 0):.4f} "  # ✅ 改为 'intrinsic_fusion'
+                       f"(Acc: {mask_res.get('acc_intrinsic_fusion', 0):.2%})")
             logger.info(f"     └─ Sparsity:       {mask_res.get('sparsity_reg', 0):.4f}")  # ✅
 
         # ✅ 修复 GNN 训练详情（键名匹配）
         logger.info(f"\n🧠 GNN Training:")
         logger.info(f"   Total Loss: {gnn_res.get('all', 0):.4f}")  # ✅ 改为 'all'
-        logger.info(f"     ├─ Invariance: {gnn_res.get('invariance', 0):.4f} "  # ✅ 改为 'invariance'
-                   f"(Acc: {gnn_res.get('acc_invariance', 0):.2%})")
+        logger.info(f"     ├─ Intrinsic: {gnn_res.get('Intrinsic', 0):.4f} "  # ✅ 改为 'Intrinsic'
+                   f"(Acc: {gnn_res.get('acc_Intrinsic', 0):.2%})")
         if not is_stage1:
-            logger.info(f"     ├─ Causal:     {gnn_res.get('causal', 0):.4f} "  # ✅ 改为 'causal'
+            logger.info(f"     ├─ spurious_fusion:     {gnn_res.get('spurious_fusion', 0):.4f} "  # ✅ 改为 'spurious_fusion'
                        f"(Acc: {gnn_res.get('acc_causal', 0):.2%})")
         logger.info(f"     └─ L1 Reg:     {gnn_res.get('l1_reg', 0):.4f}")  # ✅ 改为 'l1_reg'
 

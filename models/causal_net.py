@@ -171,7 +171,7 @@ class CausalNet(nn.Module):
         graph = readout(xs)
         return self.mlp_causal(graph)
     
-    def prediction_causal_invariance(
+    def prediction_intrinsic_path(
         self,
         x_new: torch.Tensor,
         edge: torch.Tensor,
@@ -220,7 +220,7 @@ class CausalNet(nn.Module):
         graph = readout(xs)
         return self.mlp_causal(graph)
     
-    def prediction_causal_variability(
+    def prediction_spurious_path(
         self,
         x_new: torch.Tensor,
         edge: torch.Tensor,
@@ -289,7 +289,7 @@ class CausalNet(nn.Module):
         """
         node_mask, edge_mask = masks
         node_mask_spur = 1 - node_mask  # spurious节点
-        edge_mask_spur = 1 - edge_mask  # spurious边
+        edge_mask_spur = edge_mask  # spurious边
         
         if not is_large_graph:
             raise ValueError("Spurious Fusion Graph需要大图模式")
