@@ -55,38 +55,53 @@ class TwoStageGCN(nn.Module):
         self.stage2_conv = GCN(in_features=self.hidden[-1], out_features=self.hidden[-1])
         self.stage2_bn = nn.BatchNorm1d(self.hidden[-1])
     
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge1: torch.Tensor,
-        edge2: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        执行两阶段图卷积
-        
-        Args:
-            x: 输入节点特征 [B, P, d]
-            edge1: 第一阶段边矩阵 [B, P, P]
-            edge2: 第二阶段边矩阵 [B, P, P]（可选）
-        """
-        # 第一阶段第一层
-        x = self.stage1_conv1(x, edge1)
+    def forward(self, x, edge1, edge2=None):
+        # ========== 第一阶段第一层 ==========
+        edge1_norm = self._normalize_adj_batch(edge1)
+        x = self.stage1_conv1(x, edge1_norm)
         x = F.relu(self.stage1_bn1(x.transpose(1, 2)).transpose(1, 2))
         
-        # 第一阶段第二层（使用单位矩阵）
-        batch_size, num_nodes = x.shape[0], x.shape[1]
-        identity_matrix = torch.eye(
-            num_nodes, device=x.device
-        ).unsqueeze(0).repeat(batch_size, 1, 1)
-        
-        x = self.stage1_conv2(x, identity_matrix)
+        # ========== 第一阶段第二层 ==========
+        # 修改：继续使用边矩阵而非单位矩阵
+        x = self.stage1_conv2(x, edge1_norm)  # ← 关键修改
         x = F.relu(self.stage1_bn2(x.transpose(1, 2)).transpose(1, 2))
         
-        # 第二阶段（如果提供了edge2）
+        # ========== 第二阶段 ==========
         if edge2 is not None:
-            x = torch.bmm(edge2, x)
+            edge2_norm = self._normalize_adj_batch(edge2)
+            x = torch.bmm(edge2_norm, x)
         
         return x
+    
+    @staticmethod
+    def _normalize_adj_batch(adj: torch.Tensor) -> torch.Tensor:
+        """
+        对称归一化邻接矩阵（batch版本）
+        D^{-1/2} * (A + I) * D^{-1/2}
+        
+        Args:
+            adj: [B, P, P] 邻接矩阵
+        Returns:
+            [B, P, P] 归一化后的邻接矩阵
+        """
+        # 1. 添加自环
+        identity = torch.eye(adj.size(1), device=adj.device).unsqueeze(0)
+        adj_with_self_loops = adj + identity
+        
+        # 2. 计算度矩阵
+        degree = adj_with_self_loops.sum(dim=2)  # [B, P]
+        
+        # 3. 计算 D^{-1/2}
+        degree_inv_sqrt = torch.pow(degree, -0.5)
+        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0  # 处理孤立节点（度为0）
+        
+        # 4. 对称归一化: D^{-1/2} * A * D^{-1/2}
+        # 使用广播: [B, P, 1] * [B, P, P] * [B, 1, P]
+        adj_normalized = (degree_inv_sqrt.unsqueeze(2) * 
+                         adj_with_self_loops * 
+                         degree_inv_sqrt.unsqueeze(1))
+        
+        return adj_normalized
 
 
 def readout(x: torch.Tensor) -> torch.Tensor:
