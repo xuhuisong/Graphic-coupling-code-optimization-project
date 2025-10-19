@@ -155,19 +155,7 @@ class CausalNet(nn.Module):
         # 【修正】处理 2D edge, 适用于 [P,P] 和 [N*P, N*P]
         if edge.dim() == 2:
             edge = edge.unsqueeze(0).repeat(x_new.shape[0], 1, 1)
-            
-        if is_large_graph:
-            batch_size = x_new.shape[0]
-            # 【修正】使用 self.num_patches 代替硬编码
-            P = self.num_patches 
-            x_orig = x_new[:, :P, :]
-            # edge 已经是 [B, N*P, N*P]，切片操作安全
-            edge_orig = edge[:, :P, :P]
-            xs = self.gcns2_causal(x_orig, edge_orig)
-        else:
-            # edge 已经是 [B, P, P]，直接使用
-            xs = self.gcns2_causal(x_new, edge)
-            
+        xs = self.gcns2_causal(x_new, edge)
         graph = readout(xs)
         return self.mlp_causal(graph)
     
@@ -236,38 +224,19 @@ class CausalNet(nn.Module):
         if edge.dim() == 2:
             edge = edge.unsqueeze(0).repeat(x_new.shape[0], 1, 1)
             
-        if is_large_graph:
-            batch_size = x_new.shape[0]
-            P = self.num_patches
-            x_orig = x_new[:, :P, :].clone()
-            # edge 已经是 [B, N*P, N*P]，切片操作安全
-            edge_orig = edge[:, :P, :P].clone()
+
+        causal_mask = node_mask.unsqueeze(0).unsqueeze(-1)
+        x_perturbed = x_new * (1 - causal_mask)
             
-            # 对非因果部分操作
-            causal_mask = node_mask.unsqueeze(0).unsqueeze(-1)
-            x_perturbed = x_orig * (1 - causal_mask)
+        causal_edge_mask = edge_mask.unsqueeze(0)
+        # edge 已经是 [B, P, P]，直接使用
+        edge_perturbed = edge * (1 - causal_edge_mask)
             
-            causal_edge_mask = edge_mask.unsqueeze(0)
-            edge_perturbed = edge_orig * (1 - causal_edge_mask)
+        P = x_new.shape[1]
+        identity = torch.eye(P, device=edge_perturbed.device).unsqueeze(0)
+        final_adj_perturbed = edge_perturbed + identity
             
-            # 添加自环
-            identity = torch.eye(P, device=edge_perturbed.device).unsqueeze(0)
-            final_adj_perturbed = edge_perturbed + identity
-            
-            xs = self.gcns2_causal(x_perturbed, final_adj_perturbed)
-        else:
-            causal_mask = node_mask.unsqueeze(0).unsqueeze(-1)
-            x_perturbed = x_new * (1 - causal_mask)
-            
-            causal_edge_mask = edge_mask.unsqueeze(0)
-            # edge 已经是 [B, P, P]，直接使用
-            edge_perturbed = edge * (1 - causal_edge_mask)
-            
-            P = x_new.shape[1]
-            identity = torch.eye(P, device=edge_perturbed.device).unsqueeze(0)
-            final_adj_perturbed = edge_perturbed + identity
-            
-            xs = self.gcns2_causal(x_perturbed, final_adj_perturbed)
+        xs = self.gcns2_causal(x_perturbed, final_adj_perturbed)
         
         graph = readout(xs)
         return self.mlp_causal(graph)

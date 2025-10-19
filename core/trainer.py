@@ -397,22 +397,31 @@ class CausalTrainer:
 
         for data, _, label in train_loader:
             self.global_step += 1
-
             label = label.to(self.device)
 
-            # 构建大图
-            large_data, large_edge = self.large_graph_builder.build_large_graph(
-                batch_data=data,
-                batch_labels=label,
-                base_edge=self.edge_matrix.cpu(),
-                all_data=self.all_data,
-                all_labels=self.all_labels
-            )
-            large_data = large_data.to(self.device)
-            large_edge = large_edge.to(self.device)
-
-            # 提取大图特征
-            x_features = self._extract_features(large_data)
+            # ============ 修改点1: 按阶段决定是否构建大图 ============
+            if is_stage1:
+                # 阶段1：不构建大图，直接提取特征
+                data = data.to(self.device)
+                x_features = self._extract_features(data)  # [B, P, feature_dim]
+                
+                # 准备小图边矩阵
+                B = data.shape[0]
+                edge = self.edge_matrix.unsqueeze(0).repeat(B, 1, 1)  # [B, P, P]
+                
+            else:
+                # 阶段2：构建大图
+                large_data, large_edge = self.large_graph_builder.build_large_graph(
+                    batch_data=data,
+                    batch_labels=label,
+                    base_edge=self.edge_matrix.cpu(),
+                    all_data=self.all_data,
+                    all_labels=self.all_labels
+                )
+                large_data = large_data.to(self.device)
+                large_edge = large_edge.to(self.device)
+                x_features = self._extract_features(large_data)  # [B, (N+1)*P, feature_dim]
+                edge = large_edge
 
             #========== 1. Mask训练 ==========
             for param in self.model.parameters():
@@ -422,9 +431,13 @@ class CausalTrainer:
             masks, sparsity = mask_module(train=True)
 
             if is_stage1:
-                result_mask = self._compute_stage1_mask_loss(x_features, masks, label, lambda_reg, large_edge)
+                result_mask = self._compute_stage1_mask_loss(
+                    x_features, masks, label, lambda_reg, edge, is_large_graph=False  # ← 传False
+                )
             else:
-                result_mask = self._compute_stage2_mask_loss(x_features, masks, label, lambda_reg, large_edge)
+                result_mask = self._compute_stage2_mask_loss(
+                    x_features, masks, label, lambda_reg, edge, is_large_graph=True  # ← 传True
+                )
 
             self.optimizer_mask.zero_grad()
             result_mask['loss']['all'].backward()
@@ -459,9 +472,13 @@ class CausalTrainer:
             masks = [m.detach() for m in masks]
 
             if is_stage1:
-                result_gnn = self._compute_stage1_gnn_loss(x_features, masks, label, large_edge)
+                result_gnn = self._compute_stage1_gnn_loss(
+                    x_features, masks, label, edge, is_large_graph=False  # ← 传False
+                )
             else:
-                result_gnn = self._compute_stage2_gnn_loss(x_features, masks, label, large_edge)
+                result_gnn = self._compute_stage2_gnn_loss(
+                    x_features, masks, label, edge, is_large_graph=True  # ← 传True
+                )
 
             self.optimizer.zero_grad()
             result_gnn['loss']['all'].backward()
@@ -582,17 +599,17 @@ class CausalTrainer:
     
     #==================== 损失计算 ====================
     
-    def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg, edge):
+    def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg, edge, is_large_graph):
         """阶段1 Mask损失：内在子图 + 虚假子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 内在子图
-        yci = model.prediction_intrinsic_path(x, edge, masks, True)
-        loss_ci = self.criterion(yci, label).mean()
+        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        loss_pred = self.criterion(y_pred, label).mean()
         
         # 虚假子图（熵损失）
-        ycv = model.prediction_spurious_path(x, edge, masks, True)
-        loss_cv = self._entropy_loss(ycv)
+        y_spu = model.prediction_spurious_path(x, edge, masks, is_large_graph)
+        loss_spu = self._entropy_loss(y_spu)
         
         # 稀疏性正则
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
@@ -600,36 +617,36 @@ class CausalTrainer:
         
         # 总损失
         loss_weights = self.config['train']['loss_weights']
-        loss_all = loss_weights['LCI'] * loss_ci + loss_weights['LCV'] * loss_cv + reg_loss
+        loss_all = loss_weights['L_pred'] * loss_pred + loss_weights['L_spu'] * loss_spu + reg_loss
         
         return {
             'loss': {
                 'all': loss_all,
-                'Intrinsic': loss_ci,
-                'Spurious': loss_cv,
+                'Intrinsic': loss_pred,
+                'Spurious': loss_spu,
                 'sparsity_reg': reg_loss
             },
             'preds': {
-                'Intrinsic': yci,
-                'Spurious': ycv
+                'Intrinsic': y_pred,
+                'Spurious': y_spu
             }
         }
     
-    def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg, edge):
+    def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg, edge, is_large_graph):
         """阶段2 Mask损失：虚假子图干扰 + 内在子图干扰 + 内在子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 内在子图
-        yci = model.prediction_intrinsic_path(x, edge, masks, True)
-        loss_ci = self.criterion(yci, label).mean()
+        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        loss_pred = self.criterion(y_pred, label).mean()
         
         # 虚假子图干扰性
-        yc = model.prediction_spurious_fusion(x, edge, masks, True)   # 使用相同方法
-        loss_c = self.criterion(yc, label).mean()
+        y_inv = model.prediction_spurious_fusion(x, edge, masks, is_large_graph)   # 使用相同方法
+        loss_inv = self.criterion(y_inv, label).mean()
         
         # 内在子图干扰
-        yo = model.prediction_intrinsic_fusion(x, edge, masks, True)
-        loss_o = self.criterion(yo, 1 - label).mean()
+        y_sen = model.prediction_intrinsic_fusion(x, edge, masks, is_large_graph)
+        loss_sen = self.criterion(y_sen, 1 - label).mean()
         
         # 稀疏性正则
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
@@ -637,68 +654,68 @@ class CausalTrainer:
         
         # 总损失
         loss_weights = self.config['train']['loss_weights']
-        loss_all = (loss_weights['LC'] * loss_c + 
-                   loss_weights['LO'] * loss_o + 
-                   loss_weights['LCI'] * loss_ci + 
+        loss_all = (loss_weights['L_inv'] * loss_inv + 
+                   loss_weights['L_sen'] * loss_sen + 
+                   loss_weights['L_pred'] * loss_pred + 
                    reg_loss)
         
         return {
             'loss': {
                 'all': loss_all,
-                'spurious_fusion': loss_c,
-                'intrinsic_fusion': loss_o,
-                'Intrinsic': loss_ci,
+                'spurious_fusion': loss_inv,
+                'intrinsic_fusion': loss_sen,
+                'Intrinsic': loss_pred,
                 'sparsity_reg': reg_loss
             },
             'preds': {
-                'spurious_fusion': yc,
-                'intrinsic_fusion': yo,
-                'Intrinsic': yci
+                'spurious_fusion': y_inv,
+                'intrinsic_fusion': y_sen,
+                'Intrinsic': y_pred
             }
         }
-    def _compute_stage1_gnn_loss(self, x, masks, label, edge):
+    def _compute_stage1_gnn_loss(self, x, masks, label, edge, is_large_graph):
         """阶段1 GNN损失：内在子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        yci = model.prediction_intrinsic_path(x, edge, masks, True)
-        loss_ci = self.criterion(yci, label).mean()
+        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        loss_pred = self.criterion(y_pred, label).mean()
         l1_loss = self._compute_l1_regularization()
-        loss_all = loss_ci + l1_loss
+        loss_all = loss_pred + l1_loss
         
         return {
             'loss': {
                 'all': loss_all,
-                'Intrinsic': loss_ci,
+                'Intrinsic': loss_pred,
                 'l1_reg': l1_loss
             },
             'preds': {
-                'Intrinsic': yci
+                'Intrinsic': y_pred
             }
         }
     
-    def _compute_stage2_gnn_loss(self, x, masks, label, edge):
+    def _compute_stage2_gnn_loss(self, x, masks, label, edge, is_large_graph):
         """阶段2 GNN损失：内在子图 + 虚假子图干扰"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        yci = model.prediction_intrinsic_path(x, edge, masks, True)
-        loss_ci = self.criterion(yci, label).mean()
+        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        loss_pred = self.criterion(y_pred, label).mean()
         
-        yc = model.prediction_spurious_fusion(x, edge, masks, True) 
-        loss_c = self.criterion(yc, label).mean()
+        y_inv = model.prediction_spurious_fusion(x, edge, masks, is_large_graph) 
+        loss_inv = self.criterion(y_inv, label).mean()
         
         l1_loss = self._compute_l1_regularization()
-        loss_all = loss_ci + loss_c + l1_loss
+        loss_all = loss_pred + loss_inv + l1_loss
         
         return {
             'loss': {
                 'all': loss_all,
-                'Intrinsic': loss_ci,
-                'spurious_fusion': loss_c,
+                'Intrinsic': loss_pred,
+                'spurious_fusion': loss_inv,
                 'l1_reg': l1_loss
             },
             'preds': {
-                'Intrinsic': yci,
-                'spurious_fusion': yc
+                'Intrinsic': y_pred,
+                'spurious_fusion': y_inv
             }
         }
     
