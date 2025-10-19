@@ -422,8 +422,7 @@ class CausalTrainer:
                 param.requires_grad = False
             
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            node_mask, edge_mask, _ = mask_module(train=True)
-            masks = [node_mask, edge_mask]
+            masks, sparsity = mask_module(train=True)
             
             if is_stage1:
                 result_mask = self._compute_stage1_mask_loss(x_features, masks, label, lambda_reg, large_edge)
@@ -456,8 +455,8 @@ class CausalTrainer:
             for param in self.model.parameters():
                 param.requires_grad = True
             
-            node_mask, edge_mask, _ = mask_module(train=False)
-            masks = [node_mask.detach(), edge_mask.detach()]
+            masks, sparsity = mask_module(train=False)
+            masks = [m.detach() for m in masks]
             
             if is_stage1:
                 result_gnn = self._compute_stage1_gnn_loss(x_features, masks, label, large_edge)
@@ -517,8 +516,7 @@ class CausalTrainer:
             x_features = self._extract_features(data)
             
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            node_mask, edge_mask, _ = mask_module(train=False, return_probs=True)
-            masks = [node_mask, edge_mask]
+            masks, probs, sparsity = mask_module(train=False, return_probs=True)
             
             model_module = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
             # 评估时使用小图
@@ -572,7 +570,7 @@ class CausalTrainer:
         
         # 稀疏性正则
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-        reg_loss = self._compute_sparsity_reg(mask_module, lambda_reg)
+        reg_loss = mask_module.compute_sparsity_regularization(lambda_reg=lambda_reg)
         
         # 总损失
         loss_weights = self.config['train']['loss_weights']
@@ -609,7 +607,7 @@ class CausalTrainer:
         
         # 稀疏性正则
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-        reg_loss = self._compute_sparsity_reg(mask_module, lambda_reg)
+        reg_loss = mask_module.compute_sparsity_regularization(lambda_reg=lambda_reg)
         
         # 总损失
         loss_weights = self.config['train']['loss_weights']
@@ -713,15 +711,6 @@ class CausalTrainer:
                 l1_reg += torch.sum(torch.abs(param))
         
         return self.lambda_l1 * l1_reg
-    
-    def _compute_sparsity_reg(self, mask_module, lambda_reg: float) -> torch.Tensor:
-        """计算稀疏性正则"""
-        node_probs = torch.sigmoid(mask_module.node_mask_logits)
-        edge_probs = torch.sigmoid(mask_module.edge_mask_logits)
-        
-        sparsity = lambda_reg * (node_probs.sum() + edge_probs.sum())
-        print(f"稀疏度等于:{sparsity}")
-        return sparsity
     
     def _entropy_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """熵损失（用于变异性）"""
