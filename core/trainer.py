@@ -530,45 +530,55 @@ class CausalTrainer:
         """主训练评估"""
         self.model.eval()
         self.mask.eval()
-        
+
         all_outputs = []
         all_labels = []
-        
+
         for data, _, label in data_loader:
             batch_data = data
             data = data.to(self.device)
             label = label.to(self.device)
-            
+
             x_features = self._extract_features(data)
-            
+
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
             masks, probs, sparsity = mask_module(train=False, return_probs=True)
-            
+
             model_module = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
             # 评估时使用小图
             B, P = batch_data.shape[0], batch_data.shape[1]
             small_edge = self.edge_matrix.unsqueeze(0).repeat(B, 1, 1)
             outputs = model_module.prediction_causal_invariance(x_features, small_edge, masks, is_large_graph=False)
-            
+
             all_outputs.append(outputs)
             all_labels.append(label)
-        
+
         # 计算指标
         all_outputs = torch.cat(all_outputs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
-        
+
         metrics = compute_binary_metrics(all_outputs, all_labels)
 
         self.epoch_results[epoch][phase] = metrics
 
-        # 更新最佳
+        # ✅ 修复：正确更新 best_val_acc 和 best_test_acc
         if phase == 'val' and metrics['accuracy'] > self.best_val_acc:
             self.best_val_acc = metrics['accuracy']
             self.best_epoch = epoch
-            logger.info(
-                f"💎 New Best - Acc: {metrics['accuracy']:.4f}, "
-                f"AUC: {metrics['auc']:.4f}, F1: {metrics['f1']:.4f}"
-            )
+
+            # ✅ 如果当前 epoch 已经评估过测试集，记录其准确率
+            if 'test' in self.epoch_results[epoch]:
+                self.best_test_acc = self.epoch_results[epoch]['test']['accuracy']
+                logger.info(
+                    f"💎 New Best - Val Acc: {metrics['accuracy']:.4f}, "
+                    f"Val AUC: {metrics['auc']:.4f}, "
+                    f"Test Acc: {self.best_test_acc:.4f}"
+                )
+            else:
+                logger.info(
+                    f"💎 New Best Val - Acc: {metrics['accuracy']:.4f}, "
+                    f"AUC: {metrics['auc']:.4f}, F1: {metrics['f1']:.4f}"
+                )
     
     #==================== 损失计算 ====================
     
@@ -614,11 +624,11 @@ class CausalTrainer:
         loss_ci = self.criterion(yci, label).mean()
         
         # 因果性
-        yc = model.prediction_causal_invariance(x, edge, masks, True)  # 使用相同方法
+        yc = model.prediction_spurious_fusion(x, edge, masks, True)   # 使用相同方法
         loss_c = self.criterion(yc, label).mean()
         
         # 反事实
-        yo = model.prediction_causal_variability(x, edge, masks, True)
+        yo = model.prediction_intrinsic_fusion(x, edge, masks, True)
         loss_o = self.criterion(yo, 1 - label).mean()
         
         # 稀疏性正则
@@ -673,7 +683,7 @@ class CausalTrainer:
         yci = model.prediction_causal_invariance(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
-        yc = model.prediction_causal_invariance(x, edge, masks, True)
+        yc = model.prediction_spurious_fusion(x, edge, masks, True) 
         loss_c = self.criterion(yc, label).mean()
         
         l1_loss = self._compute_l1_regularization()
@@ -863,20 +873,24 @@ class CausalTrainer:
         logger.info("\n" + "="*80)
         logger.info("🏁 Final Evaluation")
         logger.info("="*80)
-        
-        # 这里可以加载最佳模型进行最终评估
-        # 为简化，直接返回最佳结果
-        
+
+        # ✅ 如果 best_test_acc 仍然是 0，说明没有正确记录
+        # 这时应该从 epoch_results 中获取最佳 epoch 对应的测试集准确率
+        if self.best_test_acc == 0.0 and self.best_epoch >= 0:
+            if 'test' in self.epoch_results.get(self.best_epoch, {}):
+                self.best_test_acc = self.epoch_results[self.best_epoch]['test']['accuracy']
+                logger.info(f"ℹ️  Retrieved test acc from epoch {self.best_epoch + 1}")
+
         results = {
             'fold': self.fold,
             'best_epoch': self.best_epoch,
             'val_acc': self.best_val_acc,
             'test_acc': self.best_test_acc
         }
-        
+
         logger.info(f"Best Epoch:    {self.best_epoch + 1}")
         logger.info(f"Best Val Acc:  {self.best_val_acc:.4f}")
         logger.info(f"Best Test Acc: {self.best_test_acc:.4f}")
         logger.info("="*80)
-        
+
         return results
