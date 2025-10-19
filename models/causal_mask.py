@@ -69,8 +69,7 @@ class CausalMask(nn.Module):
             node_probs = torch.sigmoid(self.node_mask_logits)
             edge_probs = torch.sigmoid(self.edge_mask_logits)
             return node_mask, edge_mask, (node_probs, edge_probs)
-        
-        return node_mask, edge_mask
+        return node_mask, edge_mask, None
     
     def _gumbel_sigmoid(self, logits: torch.Tensor, tau: float) -> torch.Tensor:
         """Gumbel-Sigmoid采样"""

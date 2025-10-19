@@ -17,7 +17,7 @@ from sklearn.metrics import roc_auc_score
 from utils.checkpoint import CheckpointManager
 from models.causal_net import CausalNet
 from models.causal_mask import CausalMask
-
+from data.large_graph_builder import LargeGraphBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,13 @@ class CausalTrainer:
         self.best_model_state = None
         self.epoch_results = {}
         self.current_mask_sums = {}
+        self.large_graph_builder = LargeGraphBuilder(
+        num_neg_samples=4,
+        sampling_strategy='opposite_label',
+        random_seed=config['seed']
+    )
+        self.all_data = None
+        self.all_labels = None        
         
         # 损失函数
         self.criterion = nn.CrossEntropyLoss(reduction='none')
@@ -119,7 +126,7 @@ class CausalTrainer:
             )
             self.optimizer_mask = optim.SGD(
                 self.mask.parameters(),
-                lr=self.config['train']['base_lr'] * self.config['train']['base_lr_mask'],
+                lr= self.config['train']['base_lr_mask'],
                 momentum=0.9,
                 nesterov=self.config['train'].get('nesterov', True),
                 weight_decay=self.config['train']['weight_decay']
@@ -164,6 +171,16 @@ class CausalTrainer:
         logger.info(f"\n{'='*80}")
         logger.info(f"🚀 Training Start - Fold {self.fold}")
         logger.info(f"{'='*80}\n")
+        
+        # 预加载数据用于大图构建
+        if self.all_data is None:
+            logger.info("预加载数据用于大图构建...")
+            dataset = train_loader.dataset
+            if hasattr(dataset, 'dataset'):
+                dataset = dataset.dataset
+            self.all_data = np.array(dataset.all_patches)
+            self.all_labels = np.array(dataset.labels)
+            logger.info(f"✅ 数据预加载完成: {self.all_data.shape}")        
         
         # 初始化
         self._build_models()
@@ -384,28 +401,39 @@ class CausalTrainer:
         for data, _, label in train_loader:
             self.global_step += 1
             
-            data = data.to(self.device)
             label = label.to(self.device)
             
-            # 提取特征
-            x_features = self._extract_features(data)
+            # 🆕 构建大图
+            large_data, large_edge = self.large_graph_builder.build_large_graph(
+                batch_data=data,
+                batch_labels=label,
+                base_edge=self.edge_matrix.cpu(),
+                all_data=self.all_data,
+                all_labels=self.all_labels
+            )
+            large_data = large_data.to(self.device)
+            large_edge = large_edge.to(self.device)
+            
+            # 提取大图特征
+            x_features = self._extract_features(large_data)
             
             #========== 1. Mask训练 ==========
             for param in self.model.parameters():
                 param.requires_grad = False
             
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            masks = mask_module(train=True)
+            node_mask, edge_mask, _ = mask_module(train=True)
+            masks = [node_mask, edge_mask]
             
             if is_stage1:
-                result_mask = self._compute_stage1_mask_loss(x_features, masks, label, lambda_reg)
+                result_mask = self._compute_stage1_mask_loss(x_features, masks, label, lambda_reg, large_edge)
                 if self.rank == 0:
                     accs_mask.setdefault('invariance', []).append(
                         self._compute_accuracy(result_mask['preds']['invariance'], label))
                     accs_mask.setdefault('variability', []).append(
                         self._compute_accuracy(result_mask['preds']['variability'], label))
             else:
-                result_mask = self._compute_stage2_mask_loss(x_features, masks, label, lambda_reg)
+                result_mask = self._compute_stage2_mask_loss(x_features, masks, label, lambda_reg, large_edge)
                 if self.rank == 0:
                     accs_mask.setdefault('invariance', []).append(
                         self._compute_accuracy(result_mask['preds']['invariance'], label))
@@ -428,16 +456,16 @@ class CausalTrainer:
             for param in self.model.parameters():
                 param.requires_grad = True
             
-            masks = mask_module(train=False)
-            masks = [m.detach() for m in masks]
+            node_mask, edge_mask, _ = mask_module(train=False)
+            masks = [node_mask.detach(), edge_mask.detach()]
             
             if is_stage1:
-                result_gnn = self._compute_stage1_gnn_loss(x_features, masks, label)
+                result_gnn = self._compute_stage1_gnn_loss(x_features, masks, label, large_edge)
                 if self.rank == 0:
                     accs_gnn.setdefault('invariance', []).append(
                         self._compute_accuracy(result_gnn['preds']['invariance'], label))
             else:
-                result_gnn = self._compute_stage2_gnn_loss(x_features, masks, label)
+                result_gnn = self._compute_stage2_gnn_loss(x_features, masks, label, large_edge)
                 if self.rank == 0:
                     accs_gnn.setdefault('invariance', []).append(
                         self._compute_accuracy(result_gnn['preds']['invariance'], label))
@@ -482,16 +510,21 @@ class CausalTrainer:
         all_labels = []
         
         for data, _, label in data_loader:
+            batch_data = data
             data = data.to(self.device)
             label = label.to(self.device)
             
             x_features = self._extract_features(data)
             
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            masks = mask_module(train=False, return_probs=True)
+            node_mask, edge_mask, _ = mask_module(train=False, return_probs=True)
+            masks = [node_mask, edge_mask]
             
             model_module = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-            outputs = model_module.prediction_causal_invariance(x_features, self.edge_matrix, masks, is_large_graph=True)
+            # 评估时使用小图
+            B, P = batch_data.shape[0], batch_data.shape[1]
+            small_edge = self.edge_matrix.unsqueeze(0).repeat(B, 1, 1)
+            outputs = model_module.prediction_causal_invariance(x_features, small_edge, masks, is_large_graph=False)
             
             all_outputs.append(outputs)
             all_labels.append(label)
@@ -525,16 +558,16 @@ class CausalTrainer:
     
     #==================== 损失计算 ====================
     
-    def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg):
+    def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg, edge):
         """阶段1 Mask损失：不变性 + 变异性"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 不变性
-        yci = model.prediction_causal_invariance(x, self.edge_matrix, masks, True)
+        yci = model.prediction_causal_invariance(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
         # 变异性（熵损失）
-        ycv = model.prediction_causal_variability(x, self.edge_matrix, masks, True)
+        ycv = model.prediction_causal_variability(x, edge, masks, True)
         loss_cv = self._entropy_loss(ycv)
         
         # 稀疏性正则
@@ -558,20 +591,20 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg):
+    def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg, edge):
         """阶段2 Mask损失：因果 + 反事实 + 不变性"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 不变性
-        yci = model.prediction_causal_invariance(x, self.edge_matrix, masks, True)
+        yci = model.prediction_causal_invariance(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
         # 因果性
-        yc = model.prediction_causal_invariance(x, self.edge_matrix, masks, True)  # 使用相同方法
+        yc = model.prediction_causal_invariance(x, edge, masks, True)  # 使用相同方法
         loss_c = self.criterion(yc, label).mean()
         
         # 反事实
-        yo = model.prediction_causal_variability(x, self.edge_matrix, masks, True)
+        yo = model.prediction_causal_variability(x, edge, masks, True)
         loss_o = self.criterion(yo, 1 - label).mean()
         
         # 稀疏性正则
@@ -599,12 +632,11 @@ class CausalTrainer:
                 'invariance': yci
             }
         }
-    
-    def _compute_stage1_gnn_loss(self, x, masks, label):
+    def _compute_stage1_gnn_loss(self, x, masks, label, edge):
         """阶段1 GNN损失：不变性"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        yci = model.prediction_causal_invariance(x, self.edge_matrix, masks, True)
+        yci = model.prediction_causal_invariance(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         l1_loss = self._compute_l1_regularization()
         loss_all = loss_ci + l1_loss
@@ -620,14 +652,14 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage2_gnn_loss(self, x, masks, label):
+    def _compute_stage2_gnn_loss(self, x, masks, label, edge):
         """阶段2 GNN损失：不变性 + 因果"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        yci = model.prediction_causal_invariance(x, self.edge_matrix, masks, True)
+        yci = model.prediction_causal_invariance(x, edge, masks, True)
         loss_ci = self.criterion(yci, label).mean()
         
-        yc = model.prediction_causal_invariance(x, self.edge_matrix, masks, True)
+        yc = model.prediction_causal_invariance(x, edge, masks, True)
         loss_c = self.criterion(yc, label).mean()
         
         l1_loss = self._compute_l1_regularization()
@@ -648,15 +680,27 @@ class CausalTrainer:
     
     #==================== 辅助函数 ====================
     
-    def _extract_features(self, data: torch.Tensor) -> torch.Tensor:
-        """使用DenseNet提取特征"""
-        B, P, _, D, H, W = data.shape
-        data_reshaped = data.view(-1, 1, D, H, W)
-        
+    def _extract_features(self, data: torch.Tensor, batch_size: int = 32) -> torch.Tensor:
+        """使用DenseNet批量提取特征（避免OOM）"""
+        B = data.shape[0]
+        total_P = data.shape[1]
+
+        data_reshaped = data.view(-1, 1, data.shape[3], data.shape[4], data.shape[5])
+        total_patches = data_reshaped.shape[0]
+
+        # 批量提取，避免显存爆炸
+        all_features = []
         with torch.no_grad():
-            features = self.densenet_model(data_reshaped)
-        
-        features = features.view(B, P, -1)
+            for i in range(0, total_patches, batch_size):
+                batch = data_reshaped[i:i+batch_size]
+                features_batch = self.densenet_model(batch)
+                all_features.append(features_batch.cpu())  # 立即移到CPU
+                del features_batch
+                torch.cuda.empty_cache()
+
+        # 在CPU上拼接，再移回GPU
+        features = torch.cat(all_features, dim=0).to(self.device)
+        features = features.view(B, total_P, -1)
         return features
     
     def _compute_l1_regularization(self) -> torch.Tensor:
@@ -676,6 +720,7 @@ class CausalTrainer:
         edge_probs = torch.sigmoid(mask_module.edge_mask_logits)
         
         sparsity = lambda_reg * (node_probs.sum() + edge_probs.sum())
+        print(f"稀疏度等于:{sparsity}")
         return sparsity
     
     def _entropy_loss(self, logits: torch.Tensor) -> torch.Tensor:

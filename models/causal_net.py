@@ -194,7 +194,7 @@ class CausalNet(nn.Module):
             batch_size = x_new.shape[0]
             P = x_new.shape[1] // 5
             x_orig = x_new[:, :P, :].clone()
-            print(f"边矩阵形状：{edge.shape},P的大小：{P}")
+            #print(f"边矩阵形状：{edge.shape},P的大小：{P}")
             edge_orig = edge[:, :P, :P].clone()
             # 应用掩码
             x_masked = x_orig * node_mask.unsqueeze(0).unsqueeze(-1)

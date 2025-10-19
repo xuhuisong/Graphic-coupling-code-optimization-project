@@ -305,7 +305,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-总结果
     logger.info("\n" + "="*80)
     logger.info("训练完成！汇总结果：")
     logger.info("="*80)

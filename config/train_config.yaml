@@ -49,12 +49,18 @@ graph:
     dist_type: euc_1+gau
     adj_norm: DAD
 
+large_graph:
+  enabled: true              # 是否使用大图
+  num_neg_samples: 2         # 负样本数量
+  sampling_strategy: opposite_label  # 采样策略
+
+
 # 主训练配置
 train:
   folds: [0, 1, 2, 3, 4]        # 要训练的fold列表
-  pre_epoch: 40
-  num_epoch: 140
-  stage_transition_epoch: 80
+  pre_epoch: 2
+  num_epoch: 30
+  stage_transition_epoch: 20
   batch_size: 33
   test_batch_size: 33
   
