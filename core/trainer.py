@@ -18,6 +18,7 @@ from utils.checkpoint import CheckpointManager
 from models.causal_net import CausalNet
 from models.causal_mask import CausalMask
 from data.large_graph_builder import LargeGraphBuilder
+from utils.metrics import compute_binary_metrics, print_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -292,59 +293,42 @@ class CausalTrainer:
             }
     
     def _eval_pretrain_epoch(self, epoch: int, data_loader: DataLoader, phase: str):
-        """预训练评估"""
         self.model.eval()
-        
+
         all_outputs = []
         all_labels = []
-        losses = []
-        
+
         for data, _, label in data_loader:
             data = data.to(self.device)
             label = label.to(self.device)
-            
+
             x_features = self._extract_features(data)
             outputs = self.model.module.prediction_whole(x_features, self.edge_matrix) \
                 if isinstance(self.model, nn.DataParallel) else \
                 self.model.prediction_whole(x_features, self.edge_matrix)
-            
-            loss = self.criterion(outputs, label).mean()
-            
+
             all_outputs.append(outputs)
             all_labels.append(label)
-            losses.append(loss.item())
-        
-        # 计算指标
+
         all_outputs = torch.cat(all_outputs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
-        
-        _, predicted = torch.max(all_outputs, 1)
-        acc = (predicted == all_labels).float().mean().item()
-        
-        # AUC
-        probs = torch.softmax(all_outputs, dim=1)[:, 1].cpu().numpy()
-        try:
-            auc = roc_auc_score(all_labels.cpu().numpy(), probs)
-        except:
-            auc = 0.0
-        
+
+        # ✅ 替换为统一指标计算
+        metrics = compute_binary_metrics(all_outputs, all_labels)
+
         # 保存结果
-        self.epoch_results[epoch][phase] = {
-            'loss_all': np.mean(losses),
-            'acc_official': acc,
-            'auc': auc
-        }
-        
+        self.epoch_results[epoch][phase] = metrics
+
         # 更新最佳模型
-        if phase == 'val' and acc > self.best_val_acc:
-            self.best_val_acc = acc
+        if phase == 'val' and metrics['accuracy'] > self.best_val_acc:
+            self.best_val_acc = metrics['accuracy']
             self.best_epoch = epoch
             if isinstance(self.model, nn.DataParallel):
                 self.best_model_state = self.model.module.state_dict()
             else:
                 self.best_model_state = self.model.state_dict()
             
-            logger.info(f"💎 New Best Val Acc: {acc:.4f}")
+            logger.info(f"💎 New Best Val Acc: {metrics['accuracy']:.4f}, AUC: {metrics['auc']:.4f}")
     
     #==================== 主训练阶段 ====================
     
@@ -533,28 +517,18 @@ class CausalTrainer:
         all_outputs = torch.cat(all_outputs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         
-        _, predicted = torch.max(all_outputs, 1)
-        acc = (predicted == all_labels).float().mean().item()
-        
-        probs = torch.softmax(all_outputs, dim=1)[:, 1].cpu().numpy()
-        try:
-            auc = roc_auc_score(all_labels.cpu().numpy(), probs)
-        except:
-            auc = 0.0
-        
-        self.epoch_results[epoch][phase] = {
-            'acc_official': acc,
-            'auc': auc
-        }
-        
+        metrics = compute_binary_metrics(all_outputs, all_labels)
+
+        self.epoch_results[epoch][phase] = metrics
+
         # 更新最佳
-        if phase == 'val' and acc > self.best_val_acc:
-            self.best_val_acc = acc
+        if phase == 'val' and metrics['accuracy'] > self.best_val_acc:
+            self.best_val_acc = metrics['accuracy']
             self.best_epoch = epoch
-            logger.info(f"💎 New Best Val Acc: {acc:.4f}")
-        
-        if phase == 'test' and acc > self.best_test_acc:
-            self.best_test_acc = acc
+            logger.info(
+                f"💎 New Best - Acc: {metrics['accuracy']:.4f}, "
+                f"AUC: {metrics['auc']:.4f}, F1: {metrics['f1']:.4f}"
+            )
     
     #==================== 损失计算 ====================
     
@@ -734,17 +708,27 @@ class CausalTrainer:
         train_res = res.get('train', {})
         val_res = res.get('val', {})
         test_res = res.get('test', {})
-        
+
         logger.info("="*80)
         logger.info(f"📚 Epoch {epoch+1}/{self.config['train']['pre_epoch']} [Pre-train]")
         logger.info("-"*80)
         logger.info(f"Train - Loss: {train_res.get('loss_all', 0):.4f}, "
                    f"Acc: {train_res.get('acc_invariance', 0):.4f}")
-        logger.info(f"Val   - Loss: {val_res.get('loss_all', 0):.4f}, "
-                   f"Acc: {val_res.get('acc_official', 0):.4f}, "
-                   f"AUC: {val_res.get('auc', 0):.4f}")
-        logger.info(f"Test  - Acc: {test_res.get('acc_official', 0):.4f}, "
-                   f"AUC: {test_res.get('auc', 0):.4f}")
+
+        # ✅ 增强验证集日志
+        logger.info(f"Val   - Acc: {val_res.get('accuracy', 0):.4f}, "
+                   f"AUC: {val_res.get('auc', 0):.4f}, "
+                   f"F1: {val_res.get('f1', 0):.4f}")
+        logger.info(f"        Sens: {val_res.get('sensitivity', 0):.4f}, "
+                   f"Spec: {val_res.get('specificity', 0):.4f}")
+
+        # ✅ 增强测试集日志
+        logger.info(f"Test  - Acc: {test_res.get('accuracy', 0):.4f}, "
+                   f"AUC: {test_res.get('auc', 0):.4f}, "
+                   f"F1: {test_res.get('f1', 0):.4f}")
+        logger.info(f"        Sens: {test_res.get('sensitivity', 0):.4f}, "
+                   f"Spec: {test_res.get('specificity', 0):.4f}")
+
         logger.info("="*80 + "\n")
     
     def _print_main_summary(self, epoch: int, is_stage1: bool):
@@ -753,22 +737,32 @@ class CausalTrainer:
         train_res = res.get('train', {})
         val_res = res.get('val', {})
         test_res = res.get('test', {})
-        
+
         mask_res = train_res.get('mask', {})
         gnn_res = train_res.get('gnn', {})
-        
+
         stage_name = "Stage 1 (Invariance+Variability)" if is_stage1 else "Stage 2 (Causal+Counterfactual)"
-        
+
         logger.info("="*80)
         logger.info(f"🎯 Epoch {epoch+1}/{self.config['train']['num_epoch']} [{stage_name}]")
         logger.info("-"*80)
-        
-        # 官方评估结果
-        logger.info(f"📊 Official Evaluation:")
-        logger.info(f"   Val  - Acc: {val_res.get('acc_official', 0):.4f}, "
-                   f"AUC: {val_res.get('auc', 0):.4f}")
-        logger.info(f"   Test - Acc: {test_res.get('acc_official', 0):.4f}, "
-                   f"AUC: {test_res.get('auc', 0):.4f}")
+
+        # ✅ 增强官方评估结果
+        logger.info(f"📊 Validation Metrics:")
+        logger.info(f"   Acc: {val_res.get('accuracy', 0):.4f}, "
+                   f"AUC: {val_res.get('auc', 0):.4f}, "
+                   f"F1: {val_res.get('f1', 0):.4f}")
+        logger.info(f"   Sens: {val_res.get('sensitivity', 0):.4f}, "
+                   f"Spec: {val_res.get('specificity', 0):.4f}, "
+                   f"Prec: {val_res.get('precision', 0):.4f}")
+
+        logger.info(f"\n📊 Test Metrics:")
+        logger.info(f"   Acc: {test_res.get('accuracy', 0):.4f}, "
+                   f"AUC: {test_res.get('auc', 0):.4f}, "
+                   f"F1: {test_res.get('f1', 0):.4f}")
+        logger.info(f"   Sens: {test_res.get('sensitivity', 0):.4f}, "
+                   f"Spec: {test_res.get('specificity', 0):.4f}, "
+                   f"Prec: {test_res.get('precision', 0):.4f}")
         
         # Mask训练详情
         logger.info(f"\n🎭 Mask Training:")
