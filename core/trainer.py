@@ -373,23 +373,34 @@ class CausalTrainer:
         """主训练的一个epoch"""
         self.model.train()
         self.mask.train()
-        
-        # 损失记录器
-        losses_mask = {'all': [], 'invariance': [], 'variability': [], 'causal': [], 
-                       'counterfactual': [], 'sparsity_reg': []}
-        losses_gnn = {'all': [], 'invariance': [], 'causal': [], 'l1_reg': []}
+
+        # ✅ 修复1：损失记录器始终初始化
+        losses_mask = {
+            'all': [], 
+            'invariance': [], 
+            'variability': [], 
+            'causal': [], 
+            'counterfactual': [], 
+            'sparsity_reg': []
+        }
+        losses_gnn = {
+            'all': [], 
+            'invariance': [], 
+            'causal': [], 
+            'l1_reg': []
+        }
         accs_mask = {}
         accs_gnn = {}
-        
+
         # 计算正则化强度
         lambda_reg = 0.05 * (1 + epoch / self.config['train']['num_epoch'])
-        
+
         for data, _, label in train_loader:
             self.global_step += 1
-            
+
             label = label.to(self.device)
-            
-            # 🆕 构建大图
+
+            # 构建大图
             large_data, large_edge = self.large_graph_builder.build_large_graph(
                 batch_data=data,
                 batch_labels=label,
@@ -399,91 +410,120 @@ class CausalTrainer:
             )
             large_data = large_data.to(self.device)
             large_edge = large_edge.to(self.device)
-            
+
             # 提取大图特征
             x_features = self._extract_features(large_data)
-            
+
             #========== 1. Mask训练 ==========
             for param in self.model.parameters():
                 param.requires_grad = False
-            
+
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
             masks, sparsity = mask_module(train=True)
-            
+
             if is_stage1:
                 result_mask = self._compute_stage1_mask_loss(x_features, masks, label, lambda_reg, large_edge)
-                if self.rank == 0:
-                    accs_mask.setdefault('invariance', []).append(
-                        self._compute_accuracy(result_mask['preds']['invariance'], label))
-                    accs_mask.setdefault('variability', []).append(
-                        self._compute_accuracy(result_mask['preds']['variability'], label))
             else:
                 result_mask = self._compute_stage2_mask_loss(x_features, masks, label, lambda_reg, large_edge)
-                if self.rank == 0:
-                    accs_mask.setdefault('invariance', []).append(
-                        self._compute_accuracy(result_mask['preds']['invariance'], label))
-                    accs_mask.setdefault('causal', []).append(
-                        self._compute_accuracy(result_mask['preds']['causal'], label))
-                    accs_mask.setdefault('counterfactual', []).append(
-                        self._compute_accuracy(result_mask['preds']['counterfactual'], label))
-            
+
             self.optimizer_mask.zero_grad()
             result_mask['loss']['all'].backward()
             self.optimizer_mask.step()
-            
-            if self.rank == 0:
-                for k, v in result_mask['loss'].items():
-                    if k != 'all':
-                        losses_mask[k].append(v.item())
-                losses_mask['all'].append(result_mask['loss']['all'].item())
-            
+
+            # ✅ 修复2：立即记录损失（不管 rank）
+            losses_mask['all'].append(result_mask['loss']['all'].item())
+            if 'invariance' in result_mask['loss']:
+                losses_mask['invariance'].append(result_mask['loss']['invariance'].item())
+            if 'variability' in result_mask['loss']:
+                losses_mask['variability'].append(result_mask['loss']['variability'].item())
+            if 'causal' in result_mask['loss']:
+                losses_mask['causal'].append(result_mask['loss']['causal'].item())
+            if 'counterfactual' in result_mask['loss']:
+                losses_mask['counterfactual'].append(result_mask['loss']['counterfactual'].item())
+            if 'sparsity_reg' in result_mask['loss']:
+                losses_mask['sparsity_reg'].append(result_mask['loss']['sparsity_reg'].item())
+
+            # 记录准确率
+            for pred_type, pred_output in result_mask['preds'].items():
+                if pred_type not in accs_mask:
+                    accs_mask[pred_type] = []
+                accs_mask[pred_type].append(
+                    self._compute_accuracy(pred_output, label)
+                )
+
             #========== 2. GNN训练 ==========
             for param in self.model.parameters():
                 param.requires_grad = True
-            
+
             masks, sparsity = mask_module(train=False)
             masks = [m.detach() for m in masks]
-            
+
             if is_stage1:
                 result_gnn = self._compute_stage1_gnn_loss(x_features, masks, label, large_edge)
-                if self.rank == 0:
-                    accs_gnn.setdefault('invariance', []).append(
-                        self._compute_accuracy(result_gnn['preds']['invariance'], label))
             else:
                 result_gnn = self._compute_stage2_gnn_loss(x_features, masks, label, large_edge)
-                if self.rank == 0:
-                    accs_gnn.setdefault('invariance', []).append(
-                        self._compute_accuracy(result_gnn['preds']['invariance'], label))
-                    accs_gnn.setdefault('causal', []).append(
-                        self._compute_accuracy(result_gnn['preds']['causal'], label))
-            
+
             self.optimizer.zero_grad()
             result_gnn['loss']['all'].backward()
             self.optimizer.step()
-            
+
+            # ✅ 修复3：立即记录损失（不管 rank）
+            losses_gnn['all'].append(result_gnn['loss']['all'].item())
+            if 'invariance' in result_gnn['loss']:
+                losses_gnn['invariance'].append(result_gnn['loss']['invariance'].item())
+            if 'causal' in result_gnn['loss']:
+                losses_gnn['causal'].append(result_gnn['loss']['causal'].item())
+            if 'l1_reg' in result_gnn['loss']:
+                losses_gnn['l1_reg'].append(result_gnn['loss']['l1_reg'].item())
+
+            # 记录准确率
+            for pred_type, pred_output in result_gnn['preds'].items():
+                if pred_type not in accs_gnn:
+                    accs_gnn[pred_type] = []
+                accs_gnn[pred_type].append(
+                    self._compute_accuracy(pred_output, label)
+                )
+
+            # 记录掩码统计（仅主进程需要，用于日志）
             if self.rank == 0:
-                for k, v in result_gnn['loss'].items():
-                    if k != 'all':
-                        losses_gnn[k].append(v.item())
-                losses_gnn['all'].append(result_gnn['loss']['all'].item())
-                
-                # 记录掩码统计
                 self.current_mask_sums = {
                     'node': masks[0].sum().item(),
                     'edge': masks[1].sum().item()
                 }
-        
-        # 保存epoch结果
+
+        # ✅ 修复4：保存epoch结果（确保列表非空）
         if self.rank == 0:
             train_res = {
-                'mask': {k: np.mean(v) if v else 0 for k, v in losses_mask.items()},
-                'gnn': {k: np.mean(v) if v else 0 for k, v in losses_gnn.items()}
+                'mask': {},
+                'gnn': {}
             }
+
+            # 保存损失均值
+            for k in losses_mask.keys():
+                if len(losses_mask[k]) > 0:
+                    train_res['mask'][k] = float(np.mean(losses_mask[k]))
+                else:
+                    train_res['mask'][k] = 0.0
+
+            for k in losses_gnn.keys():
+                if len(losses_gnn[k]) > 0:
+                    train_res['gnn'][k] = float(np.mean(losses_gnn[k]))
+                else:
+                    train_res['gnn'][k] = 0.0
+
+            # 保存准确率均值
             for k, v in accs_mask.items():
-                train_res['mask'][f'acc_{k}'] = np.mean(v)
+                if len(v) > 0:
+                    train_res['mask'][f'acc_{k}'] = float(np.mean(v))
+                else:
+                    train_res['mask'][f'acc_{k}'] = 0.0
+
             for k, v in accs_gnn.items():
-                train_res['gnn'][f'acc_{k}'] = np.mean(v)
-            
+                if len(v) > 0:
+                    train_res['gnn'][f'acc_{k}'] = float(np.mean(v))
+                else:
+                    train_res['gnn'][f'acc_{k}'] = 0.0
+
             self.epoch_results[epoch]['train'] = train_res
     
     def _eval_main_epoch(self, epoch: int, data_loader: DataLoader, phase: str):
@@ -731,6 +771,7 @@ class CausalTrainer:
 
         logger.info("="*80 + "\n")
     
+
     def _print_main_summary(self, epoch: int, is_stage1: bool):
         """打印主训练总结"""
         res = self.epoch_results[epoch]
@@ -763,58 +804,58 @@ class CausalTrainer:
         logger.info(f"   Sens: {test_res.get('sensitivity', 0):.4f}, "
                    f"Spec: {test_res.get('specificity', 0):.4f}, "
                    f"Prec: {test_res.get('precision', 0):.4f}")
-        
-        # Mask训练详情
+
+        # ✅ 修复 Mask 训练详情（键名匹配）
         logger.info(f"\n🎭 Mask Training:")
-        logger.info(f"   Total Loss: {mask_res.get('loss_all', 0):.4f}")
+        logger.info(f"   Total Loss: {mask_res.get('all', 0):.4f}")  # ✅ 改为 'all'
         if is_stage1:
-            logger.info(f"     ├─ Invariance:  {mask_res.get('loss_invariance', 0):.4f} "
+            logger.info(f"     ├─ Invariance:  {mask_res.get('invariance', 0):.4f} "  # ✅ 改为 'invariance'
                        f"(Acc: {mask_res.get('acc_invariance', 0):.2%})")
-            logger.info(f"     ├─ Variability: {mask_res.get('loss_variability', 0):.4f} "
+            logger.info(f"     ├─ Variability: {mask_res.get('variability', 0):.4f} "  # ✅ 改为 'variability'
                        f"(Acc: {mask_res.get('acc_variability', 0):.2%})")
-            logger.info(f"     └─ Sparsity:    {mask_res.get('loss_sparsity_reg', 0):.4f}")
+            logger.info(f"     └─ Sparsity:    {mask_res.get('sparsity_reg', 0):.4f}")  # ✅ 改为 'sparsity_reg'
         else:
-            logger.info(f"     ├─ Invariance:     {mask_res.get('loss_invariance', 0):.4f} "
+            logger.info(f"     ├─ Invariance:     {mask_res.get('invariance', 0):.4f} "  # ✅
                        f"(Acc: {mask_res.get('acc_invariance', 0):.2%})")
-            logger.info(f"     ├─ Causal:         {mask_res.get('loss_causal', 0):.4f} "
+            logger.info(f"     ├─ Causal:         {mask_res.get('causal', 0):.4f} "  # ✅ 改为 'causal'
                        f"(Acc: {mask_res.get('acc_causal', 0):.2%})")
-            logger.info(f"     ├─ Counterfactual: {mask_res.get('loss_counterfactual', 0):.4f} "
+            logger.info(f"     ├─ Counterfactual: {mask_res.get('counterfactual', 0):.4f} "  # ✅ 改为 'counterfactual'
                        f"(Acc: {mask_res.get('acc_counterfactual', 0):.2%})")
-            logger.info(f"     └─ Sparsity:       {mask_res.get('loss_sparsity_reg', 0):.4f}")
-        
-        # GNN训练详情
+            logger.info(f"     └─ Sparsity:       {mask_res.get('sparsity_reg', 0):.4f}")  # ✅
+
+        # ✅ 修复 GNN 训练详情（键名匹配）
         logger.info(f"\n🧠 GNN Training:")
-        logger.info(f"   Total Loss: {gnn_res.get('loss_all', 0):.4f}")
-        logger.info(f"     ├─ Invariance: {gnn_res.get('loss_invariance', 0):.4f} "
+        logger.info(f"   Total Loss: {gnn_res.get('all', 0):.4f}")  # ✅ 改为 'all'
+        logger.info(f"     ├─ Invariance: {gnn_res.get('invariance', 0):.4f} "  # ✅ 改为 'invariance'
                    f"(Acc: {gnn_res.get('acc_invariance', 0):.2%})")
         if not is_stage1:
-            logger.info(f"     ├─ Causal:     {gnn_res.get('loss_causal', 0):.4f} "
+            logger.info(f"     ├─ Causal:     {gnn_res.get('causal', 0):.4f} "  # ✅ 改为 'causal'
                        f"(Acc: {gnn_res.get('acc_causal', 0):.2%})")
-        logger.info(f"     └─ L1 Reg:     {gnn_res.get('loss_l1_reg', 0):.4f}")
-        
+        logger.info(f"     └─ L1 Reg:     {gnn_res.get('l1_reg', 0):.4f}")  # ✅ 改为 'l1_reg'
+
         # 训练参数
         lr_gnn = self.optimizer.param_groups[0]['lr']
         lr_mask = self.optimizer_mask.param_groups[0]['lr']
         logger.info(f"\n⚙️  Learning Rates:")
         logger.info(f"   GNN:  {lr_gnn:.6f}")
         logger.info(f"   Mask: {lr_mask:.6f}")
-        
+
         # 掩码统计
         if self.current_mask_sums:
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
             total_nodes = mask_module.P
             total_edges = int(mask_module.learnable_mask.sum().item())
-            
+
             node_sum = int(self.current_mask_sums.get('node', 0))
             edge_sum = int(self.current_mask_sums.get('edge', 0))
-            
+
             node_pct = node_sum / total_nodes * 100 if total_nodes > 0 else 0
             edge_pct = edge_sum / total_edges * 100 if total_edges > 0 else 0
-            
+
             logger.info(f"\n🎭 Mask Statistics:")
             logger.info(f"   Nodes: {node_sum}/{total_nodes} ({node_pct:.1f}%)")
             logger.info(f"   Edges: {edge_sum}/{total_edges} ({edge_pct:.1f}%)")
-        
+
         logger.info("="*80 + "\n")
     
     def _final_evaluation(self, test_loader: DataLoader) -> Dict[str, float]:
