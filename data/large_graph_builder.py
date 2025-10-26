@@ -231,60 +231,6 @@ class LargeGraphBuilder:
         
         return large_edge
     
-    def build_cross_sample_edges(
-        self,
-        batch_size: int,
-        P: int,
-        node_mask: torch.Tensor,
-        device: torch.device
-    ) -> torch.Tensor:
-        """
-        构建跨样本边矩阵（用于因果推理）
-        
-        连接原始样本的节点与负样本的对应节点
-        
-        Args:
-            batch_size: batch大小
-            P: 单个样本的patch数量
-            node_mask: 节点掩码 [P]
-            device: 设备
-            
-        Returns:
-            cross_edges: 跨样本边矩阵 [B, (N+1)*P, (N+1)*P]
-        """
-        N = self.num_neg_samples
-        large_P = (N + 1) * P
-        
-        # 初始化跨样本边矩阵
-        cross_edges = torch.zeros(
-            (batch_size, large_P, large_P),
-            dtype=torch.float32,
-            device=device
-        )
-        
-        # 边权重：平均分配到N个负样本
-        edge_weight = 1.0 / N
-        
-        # 连接原始样本与负样本的对应节点
-        for neg_idx in range(1, N + 1):
-            for p in range(P):
-                orig_idx = p
-                neg_idx_p = neg_idx * P + p
-                
-                # 权重取决于节点掩码（非因果节点有更强的连接）
-                weight = edge_weight * (1 - node_mask[p])
-                
-                # 双向连接
-                cross_edges[:, orig_idx, neg_idx_p] = weight
-                cross_edges[:, neg_idx_p, orig_idx] = weight
-        
-        # 对角线：自环权重取决于节点掩码
-        for sample_idx in range(N + 1):
-            for p in range(P):
-                diag_idx = sample_idx * P + p
-                cross_edges[:, diag_idx, diag_idx] = node_mask[p]
-        
-        return cross_edges
 
 
 class LargeGraphDataset(Dataset):

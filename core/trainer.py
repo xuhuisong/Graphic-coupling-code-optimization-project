@@ -38,7 +38,7 @@ class CausalTrainer:
         config: Dict[str, Any],
         fold: int,
         densenet_model: nn.Module,
-        edge_matrix: np.ndarray,
+        edge_prior_mask: np.ndarray,
         checkpoint_manager: CheckpointManager,
         work_dir: str,
         device: str = 'cuda',
@@ -47,7 +47,7 @@ class CausalTrainer:
         self.config = config
         self.fold = fold
         self.densenet_model = densenet_model.to(device)
-        self.edge_matrix = torch.FloatTensor(edge_matrix).to(device)
+        self.edge_prior_mask = torch.FloatTensor(edge_prior_mask).to(device)
         self.checkpoint_manager = checkpoint_manager
         self.work_dir = work_dir
         self.device = device
@@ -99,14 +99,14 @@ class CausalTrainer:
             hidden1=self.config['model']['args']['hidden1'],
             hidden2=self.config['model']['args']['hidden2'],
             kernels=self.config['model']['args'].get('kernels', [2]),
-            num_patches=self.edge_matrix.shape[0],
+            num_patches=self.edge_prior_mask.shape[0],
             num_neg_samples=self.config['large_graph']['num_neg_samples']
         ).to(self.device)
         
         # 因果掩码模型
         self.mask = CausalMask(
-            num_patches=self.edge_matrix.shape[0],
-            edge_matrix=self.edge_matrix,
+            num_patches=self.edge_prior_mask.shape[0], 
+            edge_matrix=self.edge_prior_mask,    
             gumble_tau=self.config['misc']['gumble_tau']
         ).to(self.device)
         
@@ -265,9 +265,9 @@ class CausalTrainer:
             x_features = self._extract_features(data)
             
             # 整体预测
-            outputs = self.model.module.prediction_whole(x_features, self.edge_matrix) \
+            outputs = self.model.module.prediction_whole(x_features, self.edge_prior_mask) \
                 if isinstance(self.model, nn.DataParallel) else \
-                self.model.prediction_whole(x_features, self.edge_matrix)
+                self.model.prediction_whole(x_features, self.edge_prior_mask)
             
             loss = self.criterion(outputs, label).mean()
             l1_loss = self._compute_l1_regularization()
@@ -303,9 +303,9 @@ class CausalTrainer:
             label = label.to(self.device)
 
             x_features = self._extract_features(data)
-            outputs = self.model.module.prediction_whole(x_features, self.edge_matrix) \
+            outputs = self.model.module.prediction_whole(x_features, self.edge_prior_mask) \
                 if isinstance(self.model, nn.DataParallel) else \
-                self.model.prediction_whole(x_features, self.edge_matrix)
+                self.model.prediction_whole(x_features, self.edge_prior_mask)
 
             all_outputs.append(outputs)
             all_labels.append(label)
@@ -393,7 +393,7 @@ class CausalTrainer:
         accs_gnn = {}
 
         # 计算正则化强度
-        lambda_reg = 0.05 * (1 + epoch / self.config['train']['num_epoch'])
+        lambda_reg = 0.1 * (1 + epoch / self.config['train']['num_epoch'])
 
         for data, _, label in train_loader:
             self.global_step += 1
@@ -405,23 +405,17 @@ class CausalTrainer:
                 data = data.to(self.device)
                 x_features = self._extract_features(data)  # [B, P, feature_dim]
                 
-                # 准备小图边矩阵
-                B = data.shape[0]
-                edge = self.edge_matrix.unsqueeze(0).repeat(B, 1, 1)  # [B, P, P]
-                
             else:
                 # 阶段2：构建大图
                 large_data, large_edge = self.large_graph_builder.build_large_graph(
                     batch_data=data,
                     batch_labels=label,
-                    base_edge=self.edge_matrix.cpu(),
+                    base_edge=self.edge_prior_mask.cpu(),
                     all_data=self.all_data,
                     all_labels=self.all_labels
                 )
                 large_data = large_data.to(self.device)
-                large_edge = large_edge.to(self.device)
                 x_features = self._extract_features(large_data)  # [B, (N+1)*P, feature_dim]
-                edge = large_edge
 
             #========== 1. Mask训练 ==========
             for param in self.model.parameters():
@@ -432,11 +426,11 @@ class CausalTrainer:
 
             if is_stage1:
                 result_mask = self._compute_stage1_mask_loss(
-                    x_features, masks, label, lambda_reg, edge, is_large_graph=False  # ← 传False
+                    x_features, masks, label, lambda_reg, self.edge_prior_mask, is_large_graph=False  # ← 传False
                 )
             else:
                 result_mask = self._compute_stage2_mask_loss(
-                    x_features, masks, label, lambda_reg, edge, is_large_graph=True  # ← 传True
+                    x_features, masks, label, lambda_reg, self.edge_prior_mask, is_large_graph=True  # ← 传True
                 )
 
             self.optimizer_mask.zero_grad()
@@ -473,11 +467,11 @@ class CausalTrainer:
 
             if is_stage1:
                 result_gnn = self._compute_stage1_gnn_loss(
-                    x_features, masks, label, edge, is_large_graph=False  # ← 传False
+                    x_features, masks, label, self.edge_prior_mask, is_large_graph=False  # ← 传False
                 )
             else:
                 result_gnn = self._compute_stage2_gnn_loss(
-                    x_features, masks, label, edge, is_large_graph=True  # ← 传True
+                    x_features, masks, label, self.edge_prior_mask, is_large_graph=True  # ← 传True
                 )
 
             self.optimizer.zero_grad()
@@ -552,7 +546,6 @@ class CausalTrainer:
         all_labels = []
 
         for data, _, label in data_loader:
-            batch_data = data
             data = data.to(self.device)
             label = label.to(self.device)
 
@@ -563,9 +556,7 @@ class CausalTrainer:
 
             model_module = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
             # 评估时使用小图
-            B, P = batch_data.shape[0], batch_data.shape[1]
-            small_edge = self.edge_matrix.unsqueeze(0).repeat(B, 1, 1)
-            outputs = model_module.prediction_intrinsic_path(x_features, small_edge, masks, is_large_graph=False)
+            outputs = model_module.prediction_intrinsic_path(x_features, self.edge_prior_mask, masks, is_large_graph=False)
 
             all_outputs.append(outputs)
             all_labels.append(label)
@@ -599,16 +590,16 @@ class CausalTrainer:
     
     #==================== 损失计算 ====================
     
-    def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg, edge, is_large_graph):
+    def _compute_stage1_mask_loss(self, x, masks, label, lambda_reg, edge_prior_mask, is_large_graph):
         """阶段1 Mask损失：内在子图 + 虚假子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 内在子图
-        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
         loss_pred = self.criterion(y_pred, label).mean()
         
         # 虚假子图（熵损失）
-        y_spu = model.prediction_spurious_path(x, edge, masks, is_large_graph)
+        y_spu = model.prediction_spurious_path(x, edge_prior_mask, masks, is_large_graph)
         loss_spu = self._entropy_loss(y_spu)
         
         # 稀疏性正则
@@ -632,20 +623,20 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg, edge, is_large_graph):
+    def _compute_stage2_mask_loss(self, x, masks, label, lambda_reg, edge_prior_mask, is_large_graph):
         """阶段2 Mask损失：虚假子图干扰 + 内在子图干扰 + 内在子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 内在子图
-        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
         loss_pred = self.criterion(y_pred, label).mean()
         
         # 虚假子图干扰性
-        y_inv = model.prediction_spurious_fusion(x, edge, masks, is_large_graph)   # 使用相同方法
+        y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks, is_large_graph)   # 使用相同方法
         loss_inv = self.criterion(y_inv, label).mean()
         
         # 内在子图干扰
-        y_sen = model.prediction_intrinsic_fusion(x, edge, masks, is_large_graph)
+        y_sen = model.prediction_intrinsic_fusion(x, edge_prior_mask, masks, is_large_graph)
         loss_sen = self.criterion(y_sen, 1 - label).mean()
         
         # 稀疏性正则
@@ -673,11 +664,11 @@ class CausalTrainer:
                 'Intrinsic': y_pred
             }
         }
-    def _compute_stage1_gnn_loss(self, x, masks, label, edge, is_large_graph):
+    def _compute_stage1_gnn_loss(self, x, masks, label, edge_prior_mask, is_large_graph):
         """阶段1 GNN损失：内在子图"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
         loss_pred = self.criterion(y_pred, label).mean()
         l1_loss = self._compute_l1_regularization()
         loss_all = loss_pred + l1_loss
@@ -693,14 +684,14 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage2_gnn_loss(self, x, masks, label, edge, is_large_graph):
+    def _compute_stage2_gnn_loss(self, x, masks, label, edge_prior_mask, is_large_graph):
         """阶段2 GNN损失：内在子图 + 虚假子图干扰"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        y_pred = model.prediction_intrinsic_path(x, edge, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
         loss_pred = self.criterion(y_pred, label).mean()
         
-        y_inv = model.prediction_spurious_fusion(x, edge, masks, is_large_graph) 
+        y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks, is_large_graph) 
         loss_inv = self.criterion(y_inv, label).mean()
         
         l1_loss = self._compute_l1_regularization()

@@ -38,8 +38,8 @@ densenet:
 # 图边构建配置
 graph:
   build:
-    similarity_threshold: 0.7    # patch间相似度阈值
-    frequency_threshold: 0.3     # 边在患者中的最小出现频率
+    similarity_threshold: 0.9    # patch间相似度阈值
+    frequency_threshold: 0.5     # 边在患者中的最小出现频率
     similarity_metric: cosine    # 相似度计算方式: cosine, euclidean
     batch_size: 64              # 相似度计算批次大小
     use_all_data: true          # 使用全部数据构建边（推荐）
@@ -58,9 +58,9 @@ large_graph:
 # 主训练配置
 train:
   folds: [0, 1, 2, 3, 4]        # 要训练的fold列表
-  pre_epoch: 2
-  num_epoch: 30
-  stage_transition_epoch: 20
+  pre_epoch: 40
+  num_epoch: 140
+  stage_transition_epoch: 90
   batch_size: 33
   test_batch_size: 33
   
@@ -76,10 +76,10 @@ train:
   
   # 损失权重
   loss_weights:
-    LC: 1      # 因果损失
-    LO: 1      # 反事实损失
-    LCI: 1     # 不变性损失
-    LCV: 1     # 变异性损失
+    L_inv: 1      # 因果损失
+    L_sen: 1      # 反事实损失
+    L_pred: 1     # 不变性损失
+    L_spu: 1     # 变异性损失
     LG: 0.002  # 引导损失
     lambda_l1: 0.0001  # L1正则化
 

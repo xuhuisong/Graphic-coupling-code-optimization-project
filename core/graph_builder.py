@@ -68,27 +68,20 @@ class GraphBuilder:
         
         logger.info(f"GraphBuilder initialized with config: {self.config}")
     
-    def get_edge_matrix(
+    def get_edge_prior_mask(
         self,
         split_seed: int,
         fold_for_feature_extraction: int = 0,
         force_rebuild: bool = False
     ) -> np.ndarray:
         """
-        获取边矩阵
-        
-        自动检测缓存，如果不存在则触发构建
-        
-        Args:
-            split_seed: 数据分割种子（用于获取预训练模型）
-            fold_for_feature_extraction: 使用哪个fold的预训练模型提取特征（默认fold0）
-            force_rebuild: 是否强制重新构建（忽略缓存）
-            
-        Returns:
-            边矩阵 [num_patches, num_patches]，值为0或1
-            
-        Note:
-            边矩阵与fold无关，使用全部数据构建，所有fold共享
+        获取边的先验候选集（learnable mask）
+
+        返回一个二值化的mask [P, P]，标识哪些位置允许学习边
+        - 1 = 该位置允许动态计算边
+        - 0 = 该位置禁止有边
+
+        注意：这不是最终的边矩阵，而是动态边构建的先验约束
         """
         # 构建缓存标识符（不包含fold信息）
         config_params = {
@@ -108,13 +101,13 @@ class GraphBuilder:
         cache_exists = self.checkpoint_manager.check_exists('edges', identifier, extension='.npy')
         
         if cache_exists and not force_rebuild:
-            logger.info(f"Loading cached edge matrix: {identifier}")
-            return self._load_edge_matrix(identifier)
+            logger.info(f"Loading cached edge_prior_mask: {identifier}")
+            return self._load_edge_prior_mask(identifier)
         else:
             if force_rebuild:
-                logger.info(f"Force rebuilding edge matrix...")
+                logger.info(f"Force rebuilding edge_prior_mask...")
             else:
-                logger.info(f"No cache found, building edge matrix...")
+                logger.info(f"No cache found, building edge_prior_mask...")
             
             return self._build_and_save(
                 split_seed,
@@ -123,18 +116,18 @@ class GraphBuilder:
                 config_params
             )
     
-    def _load_edge_matrix(self, identifier: str) -> np.ndarray:
+    def _load_edge_prior_mask(self, identifier: str) -> np.ndarray:
         """从缓存加载边矩阵"""
-        edge_matrix = self.checkpoint_manager.load(
+        edge_prior_mask = self.checkpoint_manager.load(
             'edges',
             identifier,
             extension='.npy'
         )
         
-        logger.info(f"Successfully loaded edge matrix: {edge_matrix.shape}")
-        logger.info(f"Number of edges: {np.sum(edge_matrix)}")
+        logger.info(f"Successfully loaded edge_prior_mask: {edge_prior_mask.shape}")
+        logger.info(f"Number of edges: {np.sum(edge_prior_mask)}")
         
-        return edge_matrix
+        return edge_prior_mask
     
     def _build_and_save(
         self,
@@ -146,7 +139,7 @@ class GraphBuilder:
         """构建并保存边矩阵"""
 
         logger.info(f"\n{'='*70}")
-        logger.info(f"Starting Edge Matrix Construction")
+        logger.info(f"Starting edge_prior_mask Construction")
         logger.info(f"{'='*70}\n")
 
         # 1-4步保持不变...
@@ -156,14 +149,14 @@ class GraphBuilder:
         )
         all_features = self._extract_all_features(densenet_model)
         patient_edges = self._compute_patient_edges(all_features)
-        edge_matrix = self._compute_edge_frequencies(patient_edges)
+        edge_prior_mask = self._compute_edge_frequencies(patient_edges)
 
         # 5. 保存到缓存 - 修复版本
-        logger.info(f"Step 5: Saving edge matrix to cache...")
+        logger.info(f"Step 5: Saving edge_prior_mask to cache...")
 
         # 直接使用numpy保存
         save_path = self.checkpoint_manager.get_path('edges', identifier, extension='.npy')
-        np.save(str(save_path.with_suffix('')), edge_matrix)
+        np.save(str(save_path.with_suffix('')), edge_prior_mask)
 
         # 手动保存元数据
         from utils.checkpoint import CacheMetadata
@@ -180,16 +173,16 @@ class GraphBuilder:
         )
         self.checkpoint_manager._save_metadata(metadata)
 
-        logger.info(f"Successfully saved edge matrix: {identifier} ({file_size_mb:.2f} MB)")
+        logger.info(f"Successfully saved edge_prior_mask: {identifier} ({file_size_mb:.2f} MB)")
 
         logger.info(f"\n{'='*70}")
-        logger.info(f"Edge Matrix Construction Completed")
-        logger.info(f"Final edge matrix: {edge_matrix.shape}")
-        logger.info(f"Number of edges: {np.sum(edge_matrix)}")
-        logger.info(f"Edge density: {np.sum(edge_matrix) / (edge_matrix.shape[0] ** 2):.4f}")
+        logger.info(f"edge_prior_mask Construction Completed")
+        logger.info(f"Final edge_prior_mask: {edge_prior_mask.shape}")
+        logger.info(f"Number of edges: {np.sum(edge_prior_mask)}")
+        logger.info(f"Edge density: {np.sum(edge_prior_mask) / (edge_prior_mask.shape[0] ** 2):.4f}")
         logger.info(f"{'='*70}\n")
 
-        return edge_matrix
+        return edge_prior_mask
     
     def _extract_all_features(self, model: torch.nn.Module) -> np.ndarray:
         """
@@ -326,7 +319,7 @@ class GraphBuilder:
             patient_edges: [N, P, P]，每个患者的边矩阵
             
         Returns:
-            edge_matrix: [P, P]，最终的边矩阵
+            edge_prior_mask: [P, P]，最终的边矩阵
         """
         num_patients, num_patches, _ = patient_edges.shape
         
@@ -338,95 +331,20 @@ class GraphBuilder:
         
         # 应用频率阈值
         frequency_threshold = self.config['frequency_threshold']
-        edge_matrix = (edge_frequencies >= frequency_threshold).astype(np.uint8)
+        edge_prior_mask = (edge_frequencies >= frequency_threshold).astype(np.uint8)
         
         # 确保对称性（无向图）
-        edge_matrix = np.maximum(edge_matrix, edge_matrix.T)
+        edge_prior_mask = np.maximum(edge_prior_mask, edge_prior_mask.T)
         
         # 移除自环
-        np.fill_diagonal(edge_matrix, 0)
+        np.fill_diagonal(edge_prior_mask, 0)
         
         # 统计信息
         logger.info(f"Edge frequency statistics:")
         logger.info(f"  Frequency threshold: {frequency_threshold}")
         logger.info(f"  Max edge frequency: {edge_frequencies.max():.3f}")
         logger.info(f"  Mean edge frequency: {edge_frequencies.mean():.3f}")
-        logger.info(f"  Edges above threshold: {np.sum(edge_matrix)}")
+        logger.info(f"  Edges above threshold: {np.sum(edge_prior_mask)}")
         
-        return edge_matrix
+        return edge_prior_mask
     
-    def visualize_edge_matrix(
-        self,
-        edge_matrix: np.ndarray,
-        save_path: Optional[str] = None
-    ) -> None:
-        """
-        可视化边矩阵
-        
-        Args:
-            edge_matrix: 边矩阵 [P, P]
-            save_path: 保存路径（可选）
-        """
-        try:
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-            
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(
-                edge_matrix,
-                cmap='Blues',
-                cbar=True,
-                square=True,
-                xticklabels=False,
-                yticklabels=False
-            )
-            plt.title(f'Edge Matrix ({np.sum(edge_matrix)} edges)')
-            plt.xlabel('Patch Index')
-            plt.ylabel('Patch Index')
-            
-            if save_path:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                logger.info(f"Edge matrix visualization saved to: {save_path}")
-            else:
-                plt.show()
-            
-            plt.close()
-            
-        except ImportError:
-            logger.warning("matplotlib/seaborn not available, skipping visualization")
-    
-    def analyze_edge_statistics(self, edge_matrix: np.ndarray) -> Dict[str, Any]:
-        """
-        分析边矩阵的统计特性
-        
-        Args:
-            edge_matrix: 边矩阵 [P, P]
-            
-        Returns:
-            统计信息字典
-        """
-        num_patches = edge_matrix.shape[0]
-        num_edges = np.sum(edge_matrix)
-        
-        # 度分布
-        degree = np.sum(edge_matrix, axis=1)
-        
-        stats = {
-            'num_patches': num_patches,
-            'num_edges': int(num_edges),
-            'edge_density': float(num_edges / (num_patches ** 2)),
-            'avg_degree': float(np.mean(degree)),
-            'max_degree': int(np.max(degree)),
-            'min_degree': int(np.min(degree)),
-            'std_degree': float(np.std(degree)),
-            'degree_distribution': degree.tolist()
-        }
-        
-        logger.info(f"\nEdge Matrix Statistics:")
-        logger.info(f"  Number of patches: {stats['num_patches']}")
-        logger.info(f"  Number of edges: {stats['num_edges']}")
-        logger.info(f"  Edge density: {stats['edge_density']:.4f}")
-        logger.info(f"  Average degree: {stats['avg_degree']:.2f}")
-        logger.info(f"  Degree range: [{stats['min_degree']}, {stats['max_degree']}]")
-        
-        return stats

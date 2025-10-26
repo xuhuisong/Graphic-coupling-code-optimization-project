@@ -13,8 +13,10 @@ class CausalMask(nn.Module):
     """
     因果掩码学习器
     
-    为每个节点/边学习两个logits [非因果, 因果]
-    使用Gumbel-Softmax进行二选一采样
+    Args:
+        num_patches: patch数量
+        edge_matrix: 边的先验候选集 [P, P]，标识哪些位置允许学习边
+        gumble_tau: Gumbel-Softmax 温度参数
     """
     
     def __init__(
@@ -134,7 +136,7 @@ class CausalMask(nn.Module):
         
         # 不同权重
         node_sparsity_weight = 1.5
-        edge_sparsity_weight = 0.1
+        edge_sparsity_weight = 2
         
         total_sparsity_loss = (node_sparsity_weight * node_sparsity_loss + 
                                edge_sparsity_weight * edge_sparsity_loss)
