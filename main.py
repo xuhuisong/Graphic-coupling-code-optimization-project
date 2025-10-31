@@ -50,7 +50,7 @@ def run_training_for_fold(
     config: dict,
     fold: int,
     densenet_model,
-    edge_matrix,
+    edge_prior_mask,
     checkpoint_manager: CheckpointManager,
     exp_dir: Path
 ) -> dict:
@@ -129,7 +129,7 @@ def run_training_for_fold(
         config=config,
         fold=fold,
         densenet_model=densenet_model,
-        edge_matrix=edge_matrix,
+        edge_prior_mask=edge_prior_mask,
         checkpoint_manager=checkpoint_manager,
         work_dir=str(work_dir),
         device=f"cuda:{config['misc']['device'][0]}" if config['misc']['device'] else 'cuda',
@@ -220,18 +220,17 @@ def main():
     
     # 4. 构建全局边矩阵（所有 fold 共享）
     logger.info("\n" + "="*80)
-    logger.info("🕸️  构建/加载图边矩阵...")
+    logger.info("🕸️  构建/加载边先验候选集...")
     logger.info("="*80)
     
-    edge_matrix = graph_builder.get_edge_matrix(
+    edge_prior_mask = graph_builder.get_edge_prior_mask(
         split_seed=config['split_seed'],
         fold_for_feature_extraction=0
     )
-    
-    logger.info(f"✅ 边矩阵准备完成:")
-    logger.info(f"   形状: {edge_matrix.shape}")
-    logger.info(f"   边数: {edge_matrix.sum()}")
-    logger.info(f"   密度: {edge_matrix.sum() / (edge_matrix.shape[0] ** 2):.4f}")
+    logger.info(f"✅ 边先验候选集准备完成:")
+    logger.info(f"   形状: {edge_prior_mask.shape}")
+    logger.info(f"   可学习边位置数: {edge_prior_mask.sum()}")
+    logger.info(f"   密度: {edge_prior_mask.sum() / (edge_prior_mask.shape[0] ** 2):.4f}")
     
     # 5. 执行每个 fold 的训练
     folds_to_train = args.folds if args.folds else config['train']['folds']
@@ -255,7 +254,7 @@ def main():
             config=config,
             fold=fold,
             densenet_model=densenet_model,
-            edge_matrix=edge_matrix,
+            edge_prior_mask=edge_prior_mask,
             checkpoint_manager=checkpoint_manager,
             exp_dir=exp_dir
         )
