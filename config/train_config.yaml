@@ -22,15 +22,12 @@ cache:
 # DenseNet预训练配置
 densenet:
   pretrain:
-    num_epochs: 50
-    stage1_epochs: 49       # 阶段1轮数（无mask）
-    mask_ratio: 0.3         # 阶段2的mask比例
-    batch_size: 16
-    learning_rate_stage1: 0.0001
-    learning_rate_stage2: 0.0004
-    weight_decay_stage1: 0.0001
-    weight_decay_stage2: 0.00001
+    num_epochs: 70
+    batch_size: 24
+    learning_rate: 0.0005
+    weight_decay: 0.0001
     num_workers: 4
+    'patience': 40
   model:
     growth_rate: 8
     num_init_features: 24
@@ -58,9 +55,9 @@ large_graph:
 # 主训练配置
 train:
   folds: [0, 1, 2, 3, 4]        # 要训练的fold列表
-  pre_epoch: 40
+  pre_epoch: 60
   num_epoch: 140
-  stage_transition_epoch: 90
+  stage_transition_epoch: 100
   batch_size: 33
   test_batch_size: 33
   

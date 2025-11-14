@@ -15,19 +15,16 @@ class PatchDataset(Dataset):
     """
     Patch数据集
     
-    从预处理好的 data.npy 和 label.pkl 文件加载patch数据
-    
-    Args:
-        data_dir: 数据目录路径
-        
-    Attributes:
-        all_patches: 所有样本的patch数据 [N, P, D, H, W]
-        labels: 样本标签 [N]
-        subject_ids: 样本ID [N]
+    [修改版]:
+    1. __init__ 接受一个可选的 transform。
+    2. __getitem__ 应用 Z-Score 归一化。
+    3. __getitem__ 以 (C, H, W, D) 格式应用 transform，以实现快速、一致的增强。
+    4. __getitem__ 最终返回 (P, 1, D, H, W) 以匹配模型的输入。
     """
     
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, transform = None): # <--- 修改点 1
         self.data_dir = data_dir
+        self.transform = transform # <--- 修改点 2
         
         # 加载数据
         data_path = os.path.join(data_dir, 'data.npy')
@@ -38,13 +35,16 @@ class PatchDataset(Dataset):
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"Label file not found: {label_path}")
         
-        # 使用内存映射模式加载大文件，节省内存
         self.all_patches = np.load(data_path, mmap_mode='r')
         
         with open(label_path, 'rb') as f:
-            self.labels, self.subject_ids = pickle.load(f)
-        
-        # 验证数据一致性
+            loaded_data = pickle.load(f)
+            self.labels = loaded_data[0]
+            self.subject_ids = loaded_data[1]
+            
+        if not isinstance(self.labels, np.ndarray):
+            self.labels = np.array(self.labels)
+            
         assert len(self.all_patches) == len(self.labels), \
             f"Data-label mismatch: {len(self.all_patches)} vs {len(self.labels)}"
         
@@ -59,33 +59,39 @@ class PatchDataset(Dataset):
         """
         获取单个样本
         
-        Args:
-            idx: 样本索引
-            
         Returns:
             patches: patch tensor [P, 1, D, H, W]
-            subject_id: 样本ID
-            label: 标签
+            ...
         """
-        # 从内存映射中加载数据并立即转换为副本
+        # 1. 加载数据 (P, D, H, W)
         subject_patches = np.array(self.all_patches[idx])
         
-        # 转换为tensor并添加通道维度
-        patches_tensor = torch.from_numpy(subject_patches).float().unsqueeze(1)
+        # 2. 转为 Tensor (P, D, H, W)
+        patches_tensor = torch.from_numpy(subject_patches).float()
+        
+        # 3. Z-Score 归一化 (样本级别)
+        p_mean = patches_tensor.mean()
+        p_std = patches_tensor.std()
+        patches_tensor = (patches_tensor - p_mean) / (p_std + 1e-6)
+        
+        # 4. 应用快速、一致的数据增强
+        # MONAI 将 (P, D, H, W) 视为 (C, H, W, D)
+        if self.transform:
+            patches_tensor = self.transform(patches_tensor)
+            
+        # 5. 增加通道维度，以匹配模型输入
+        patches_tensor = patches_tensor.unsqueeze(1) # Shape: (P, 1, D, H, W)
         
         label = int(self.labels[idx])
         subject_id = self.subject_ids[idx]
         
         return patches_tensor, subject_id, label
-    
+        
     def get_num_patches(self) -> int:
-        """获取每个样本的patch数量"""
         return self.num_patches
     
     def get_patch_shape(self) -> Tuple[int, ...]:
-        """获取单个patch的形状"""
         return self.patch_shape
-
 
 def collate_fn(batch: List[Tuple]) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
     """

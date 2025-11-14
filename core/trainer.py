@@ -70,10 +70,18 @@ class CausalTrainer:
         
         # 训练状态
         self.global_step = 0
+
+        # 预训练阶段状态
+        self.pretrain_best_val_acc = 0.0
+        self.pretrain_best_model_state = None
+        self.pretrain_best_epoch = -1
+
+        # 主训练阶段状态（用于最终评估）
         self.best_val_acc = 0.0
         self.best_test_acc = 0.0
         self.best_epoch = -1
         self.best_model_state = None
+
         self.epoch_results = {}
         self.current_mask_sums = {}
         self.large_graph_builder = LargeGraphBuilder(
@@ -119,48 +127,48 @@ class CausalTrainer:
     
     def _setup_optimizers(self):
         """设置优化器"""
-        if self.config['train']['optimizer'] == 'SGD':
-            self.optimizer = optim.SGD(
-                self.model.parameters(),
-                lr=self.config['train']['base_lr'],
-                momentum=0.9,
-                nesterov=self.config['train'].get('nesterov', True),
-                weight_decay=self.config['train']['weight_decay']
-            )
-            self.optimizer_mask = optim.SGD(
-                self.mask.parameters(),
-                lr= self.config['train']['base_lr_mask'],
-                momentum=0.9,
-                nesterov=self.config['train'].get('nesterov', True),
-                weight_decay=self.config['train']['weight_decay']
-            )
-        
-        # 学习率调度器
-        if self.config['train']['scheduler'] == 'auto':
-            self.lr_scheduler = ReduceLROnPlateau(
-                self.optimizer,
-                verbose=(self.rank == 0),
-                patience=self.config['train']['stepsize'],
-                factor=self.config['train']['gamma']
-            )
-            self.lr_scheduler_mask = ReduceLROnPlateau(
-                self.optimizer_mask,
-                verbose=(self.rank == 0),
-                patience=self.config['train']['stepsize'],
-                factor=self.config['train']['gamma']
-            )
-        elif self.config['train']['scheduler'] == 'step':
-            self.lr_scheduler = StepLR(
-                self.optimizer,
-                step_size=self.config['train']['stepsize'],
-                gamma=self.config['train']['gamma']
-            )
-            self.lr_scheduler_mask = StepLR(
-                self.optimizer_mask,
-                step_size=self.config['train']['stepsize'],
-                gamma=self.config['train']['gamma']
-            )
-        
+        # 预训练阶段：使用与DenseNet相同的Adam配置
+        self.optimizer_pretrain = optim.Adam(
+            self.model.parameters(),
+            lr=self.config['densenet']['pretrain']['learning_rate'],
+            weight_decay=self.config['densenet']['pretrain']['weight_decay']
+        )
+        self.scheduler_pretrain = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer_pretrain,
+            T_max=self.config['train']['pre_epoch'],
+            eta_min=1e-5
+        )
+
+        # 主训练阶段：使用SGD
+        self.optimizer = optim.SGD(
+            self.model.parameters(),
+            lr=self.config['train']['base_lr'],
+            momentum=0.9,
+            nesterov=True,
+            weight_decay=self.config['train']['weight_decay']
+        )
+        self.optimizer_mask = optim.SGD(
+            self.mask.parameters(),
+            lr=self.config['train']['base_lr_mask'],
+            momentum=0.9,
+            nesterov=True,
+            weight_decay=self.config['train']['weight_decay']
+        )
+
+        # 主训练学习率调度器
+        self.lr_scheduler = ReduceLROnPlateau(
+            self.optimizer,
+            verbose=(self.rank == 0),
+            patience=self.config['train']['stepsize'],
+            factor=self.config['train']['gamma']
+        )
+        self.lr_scheduler_mask = ReduceLROnPlateau(
+            self.optimizer_mask,
+            verbose=(self.rank == 0),
+            patience=self.config['train']['stepsize'],
+            factor=self.config['train']['gamma']
+        )
+
         logger.info("✅ Optimizers configured")
     
     def train(
@@ -227,18 +235,21 @@ class CausalTrainer:
         for epoch in range(num_epochs):
             if self.rank == 0:
                 self.epoch_results[epoch] = {}
-            
+
             # 训练
             self._train_pretrain_epoch(epoch, train_loader)
-            
+
             # 评估
             if self.rank == 0:
                 with torch.no_grad():
                     self._eval_pretrain_epoch(epoch, val_loader, 'val')
                     self._eval_pretrain_epoch(epoch, test_loader, 'test')
-                
+
                 self._print_pretrain_summary(epoch)
-        
+
+            # 更新学习率 - 添加这行
+            self.scheduler_pretrain.step()
+
         # 加载最佳模型
         if self.rank == 0 and self.best_model_state:
             logger.info(f"✅ Loading best pretrain model (Epoch {self.best_epoch+1})")
@@ -274,9 +285,9 @@ class CausalTrainer:
             loss_total = loss + l1_loss
             
             # 反向传播
-            self.optimizer.zero_grad()
+            self.optimizer_pretrain.zero_grad()  # 改这里
             loss_total.backward()
-            self.optimizer.step()
+            self.optimizer_pretrain.step()  # 改这里
             
             # 记录
             if self.rank == 0:
@@ -313,53 +324,64 @@ class CausalTrainer:
         all_outputs = torch.cat(all_outputs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
 
-        # ✅ 替换为统一指标计算
         metrics = compute_binary_metrics(all_outputs, all_labels)
-
-        # 保存结果
         self.epoch_results[epoch][phase] = metrics
 
-        # 更新最佳模型
-        if phase == 'val' and metrics['accuracy'] > self.best_val_acc:
-            self.best_val_acc = metrics['accuracy']
-            self.best_epoch = epoch
+        # ✅ 使用预训练专属的最佳模型追踪
+        if phase == 'val' and metrics['accuracy'] > self.pretrain_best_val_acc:
+            self.pretrain_best_val_acc = metrics['accuracy']
+            self.pretrain_best_epoch = epoch
+
+            # 保存预训练最佳模型
             if isinstance(self.model, nn.DataParallel):
-                self.best_model_state = self.model.module.state_dict()
+                self.pretrain_best_model_state = self.model.module.state_dict()
             else:
-                self.best_model_state = self.model.state_dict()
-            
-            logger.info(f"💎 New Best Val Acc: {metrics['accuracy']:.4f}, AUC: {metrics['auc']:.4f}")
+                self.pretrain_best_model_state = self.model.state_dict()
+
+            logger.info(f"💎 New Best Pretrain Val Acc: {metrics['accuracy']:.4f}, AUC: {metrics['auc']:.4f}")
     
     #==================== 主训练阶段 ====================
-    
-    def _main_training(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        test_loader: DataLoader
-    ):
+    def _main_training(self, train_loader, val_loader, test_loader):
         """主训练阶段（阶段1+阶段2）"""
         start_epoch = self.config['train']['pre_epoch']
         num_epochs = self.config['train']['num_epoch']
         stage_transition = self.config['train']['stage_transition_epoch']
-        
+
+        # ✅ 阶段1的最佳模型追踪
+        stage1_best_val_acc = 0.0
+        stage1_best_model_state = None
+        stage1_best_epoch = -1
+
         for epoch in range(start_epoch, num_epochs):
             is_stage1 = epoch < stage_transition
-            
+
             if self.rank == 0:
                 self.epoch_results[epoch] = {}
-            
+
             # 训练
             self._train_main_epoch(epoch, train_loader, is_stage1)
-            
+
             # 评估
             if self.rank == 0:
                 with torch.no_grad():
                     self._eval_main_epoch(epoch, val_loader, 'val')
                     self._eval_main_epoch(epoch, test_loader, 'test')
-                
+
+                # ✅ 阶段1：保存阶段1最佳模型
+                if is_stage1:
+                    val_acc = self.epoch_results[epoch]['val']['accuracy']
+                    if val_acc > stage1_best_val_acc:
+                        stage1_best_val_acc = val_acc
+                        stage1_best_epoch = epoch
+                        if isinstance(self.model, nn.DataParallel):
+                            stage1_best_model_state = self.model.module.state_dict()
+                        else:
+                            stage1_best_model_state = self.model.state_dict()
+
+                        logger.info(f"💎 New Best Stage1 Val Acc: {val_acc:.4f}")
+
                 self._print_main_summary(epoch, is_stage1)
-                
+
                 # 更新学习率
                 if self.config['train']['scheduler'] == 'auto':
                     val_loss = self.epoch_results[epoch]['val'].get('gnn', {}).get('loss_all', 0)
@@ -368,6 +390,19 @@ class CausalTrainer:
                 else:
                     self.lr_scheduler.step()
                     self.lr_scheduler_mask.step()
+
+            # ✅ 阶段1结束：加载阶段1最佳模型作为阶段2起点
+            if epoch == stage_transition - 1 and self.rank == 0 and stage1_best_model_state:
+                logger.info(f"\n{'='*80}")
+                logger.info(f"✅ Stage 1 Completed! Loading best Stage1 model as Stage2 starting point")
+                logger.info(f"   Best Stage1 Epoch: {stage1_best_epoch + 1}")
+                logger.info(f"   Best Stage1 Val Acc: {stage1_best_val_acc:.4f}")
+                logger.info(f"{'='*80}\n")
+
+                # 重置阶段2的追踪器
+                self.best_val_acc = 0.0
+                self.best_test_acc = 0.0
+                self.best_epoch = -1
     
     def _train_main_epoch(self, epoch: int, train_loader: DataLoader, is_stage1: bool):
         """主训练的一个epoch"""
@@ -550,43 +585,39 @@ class CausalTrainer:
             label = label.to(self.device)
 
             x_features = self._extract_features(data)
-
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
             masks, probs, sparsity = mask_module(train=False, return_probs=True)
 
             model_module = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-            # 评估时使用小图
             outputs = model_module.prediction_intrinsic_path(x_features, self.edge_prior_mask, masks, is_large_graph=False)
 
             all_outputs.append(outputs)
             all_labels.append(label)
 
-        # 计算指标
         all_outputs = torch.cat(all_outputs, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
-
         metrics = compute_binary_metrics(all_outputs, all_labels)
-
         self.epoch_results[epoch][phase] = metrics
 
-        # ✅ 修复：正确更新 best_val_acc 和 best_test_acc
-        if phase == 'val' and metrics['accuracy'] > self.best_val_acc:
+        # ✅ 仅在阶段2更新最终评估的最佳模型
+        stage_transition = self.config['train']['stage_transition_epoch']
+        if phase == 'val' and epoch >= stage_transition and metrics['accuracy'] > self.best_val_acc:
             self.best_val_acc = metrics['accuracy']
             self.best_epoch = epoch
 
-            # ✅ 如果当前 epoch 已经评估过测试集，记录其准确率
             if 'test' in self.epoch_results[epoch]:
                 self.best_test_acc = self.epoch_results[epoch]['test']['accuracy']
                 logger.info(
-                    f"💎 New Best - Val Acc: {metrics['accuracy']:.4f}, "
+                    f"💎 New Best Stage2 - Val Acc: {metrics['accuracy']:.4f}, "
                     f"Val AUC: {metrics['auc']:.4f}, "
                     f"Test Acc: {self.best_test_acc:.4f}"
                 )
             else:
                 logger.info(
-                    f"💎 New Best Val - Acc: {metrics['accuracy']:.4f}, "
+                    f"💎 New Best Stage2 Val - Acc: {metrics['accuracy']:.4f}, "
                     f"AUC: {metrics['auc']:.4f}, F1: {metrics['f1']:.4f}"
                 )
+                
     
     #==================== 损失计算 ====================
     
