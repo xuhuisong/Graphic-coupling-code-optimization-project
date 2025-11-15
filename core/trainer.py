@@ -391,7 +391,7 @@ class CausalTrainer:
                     self.lr_scheduler.step()
                     self.lr_scheduler_mask.step()
 
-            # ✅ 阶段1结束：加载阶段1最佳模型作为阶段2起点
+            # ✅ 阶段1结束
             if epoch == stage_transition - 1 and self.rank == 0 and stage1_best_model_state:
                 logger.info(f"\n{'='*80}")
                 logger.info(f"✅ Stage 1 Completed! Loading best Stage1 model as Stage2 starting point")
@@ -403,174 +403,256 @@ class CausalTrainer:
                 self.best_val_acc = 0.0
                 self.best_test_acc = 0.0
                 self.best_epoch = -1
-    
+
     def _train_main_epoch(self, epoch: int, train_loader: DataLoader, is_stage1: bool):
-        """主训练的一个epoch"""
-        self.model.train()
-        self.mask.train()
+            """主训练的一个epoch (V3 - 修复了 'int' object has no attribute 'item' 错误)"""
 
-        # ✅ 修复1：损失记录器始终初始化
-        losses_mask = {
-            'all': [], 
-            'Intrinsic': [], 
-            'Spurious': [], 
-            'spurious_fusion': [], 
-            'intrinsic_fusion': [], 
-            'sparsity_reg': []
-        }
-        losses_gnn = {
-            'all': [], 
-            'Intrinsic': [], 
-            'spurious_fusion': [], 
-            'l1_reg': []
-        }
-        accs_mask = {}
-        accs_gnn = {}
+            # ========== 【新】安全获取损失值的辅助函数 ==========
+            def _safe_get_item(loss_dict: dict, key: str) -> float:
+                """
+                安全地从损失字典中获取值并转换为浮点数。
+                无论值是 Tensor, int, 还是 float, 都能处理。
+                """
+                # 设置一个默认张量，以防key不存在
+                default_tensor = torch.tensor(0.0, device=self.device)
+                val = loss_dict.get(key, default_tensor)
 
-        # 计算正则化强度
-        lambda_reg = 0.1 * (1 + epoch / self.config['train']['num_epoch'])
+                if isinstance(val, torch.Tensor):
+                    return val.item() # 如果是张量，调用 .item()
+                elif isinstance(val, (int, float)):
+                    return float(val) # 如果是 int/float (比如 0)，直接转换
+                else:
+                    logger.warning(f"无法识别的损失类型 {type(val)} for key {key}. 返回 0.0")
+                    return 0.0
+            # =======================================================
 
-        for data, _, label in train_loader:
-            self.global_step += 1
-            label = label.to(self.device)
+            self.model.train()
+            self.mask.train()
 
-            # ============ 修改点1: 按阶段决定是否构建大图 ============
-            if is_stage1:
-                # 阶段1：不构建大图，直接提取特征
-                data = data.to(self.device)
-                x_features = self._extract_features(data)  # [B, P, feature_dim]
-                
-            else:
-                # 阶段2：构建大图
-                large_data, large_edge = self.large_graph_builder.build_large_graph(
-                    batch_data=data,
-                    batch_labels=label,
-                    base_edge=self.edge_prior_mask.cpu(),
-                    all_data=self.all_data,
-                    all_labels=self.all_labels
-                )
-                large_data = large_data.to(self.device)
-                x_features = self._extract_features(large_data)  # [B, (N+1)*P, feature_dim]
-
-            #========== 1. Mask训练 ==========
-            for param in self.model.parameters():
-                param.requires_grad = False
-
-            mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            masks, sparsity = mask_module(train=True)
-
-            if is_stage1:
-                result_mask = self._compute_stage1_mask_loss(
-                    x_features, masks, label, lambda_reg, self.edge_prior_mask, is_large_graph=False  # ← 传False
-                )
-            else:
-                result_mask = self._compute_stage2_mask_loss(
-                    x_features, masks, label, lambda_reg, self.edge_prior_mask, is_large_graph=True  # ← 传True
-                )
-
-            self.optimizer_mask.zero_grad()
-            result_mask['loss']['all'].backward()
-            self.optimizer_mask.step()
-
-            # ✅ 修复2：立即记录损失（不管 rank）
-            losses_mask['all'].append(result_mask['loss']['all'].item())
-            if 'Intrinsic' in result_mask['loss']:
-                losses_mask['Intrinsic'].append(result_mask['loss']['Intrinsic'].item())
-            if 'Spurious' in result_mask['loss']:
-                losses_mask['Spurious'].append(result_mask['loss']['Spurious'].item())
-            if 'spurious_fusion' in result_mask['loss']:
-                losses_mask['spurious_fusion'].append(result_mask['loss']['spurious_fusion'].item())
-            if 'intrinsic_fusion' in result_mask['loss']:
-                losses_mask['intrinsic_fusion'].append(result_mask['loss']['intrinsic_fusion'].item())
-            if 'sparsity_reg' in result_mask['loss']:
-                losses_mask['sparsity_reg'].append(result_mask['loss']['sparsity_reg'].item())
-
-            # 记录准确率
-            for pred_type, pred_output in result_mask['preds'].items():
-                if pred_type not in accs_mask:
-                    accs_mask[pred_type] = []
-                accs_mask[pred_type].append(
-                    self._compute_accuracy(pred_output, label)
-                )
-
-            #========== 2. GNN训练 ==========
-            for param in self.model.parameters():
-                param.requires_grad = True
-
-            masks, sparsity = mask_module(train=False)
-            masks = [m.detach() for m in masks]
-
-            if is_stage1:
-                result_gnn = self._compute_stage1_gnn_loss(
-                    x_features, masks, label, self.edge_prior_mask, is_large_graph=False  # ← 传False
-                )
-            else:
-                result_gnn = self._compute_stage2_gnn_loss(
-                    x_features, masks, label, self.edge_prior_mask, is_large_graph=True  # ← 传True
-                )
-
-            self.optimizer.zero_grad()
-            result_gnn['loss']['all'].backward()
-            self.optimizer.step()
-
-            # ✅ 修复3：立即记录损失（不管 rank）
-            losses_gnn['all'].append(result_gnn['loss']['all'].item())
-            if 'Intrinsic' in result_gnn['loss']:
-                losses_gnn['Intrinsic'].append(result_gnn['loss']['Intrinsic'].item())
-            if 'spurious_fusion' in result_gnn['loss']:
-                losses_gnn['spurious_fusion'].append(result_gnn['loss']['spurious_fusion'].item())
-            if 'l1_reg' in result_gnn['loss']:
-                losses_gnn['l1_reg'].append(result_gnn['loss']['l1_reg'].item())
-
-            # 记录准确率
-            for pred_type, pred_output in result_gnn['preds'].items():
-                if pred_type not in accs_gnn:
-                    accs_gnn[pred_type] = []
-                accs_gnn[pred_type].append(
-                    self._compute_accuracy(pred_output, label)
-                )
-
-            # 记录掩码统计（仅主进程需要，用于日志）
-            if self.rank == 0:
-                self.current_mask_sums = {
-                    'node': masks[0].sum().item(),
-                    'edge': masks[1].sum().item()
-                }
-
-        # ✅ 修复4：保存epoch结果（确保列表非空）
-        if self.rank == 0:
-            train_res = {
-                'mask': {},
-                'gnn': {}
+            losses_mask = {
+                'all': [], 'Intrinsic': [], 'Spurious': [], 'spurious_fusion': [],
+                'intrinsic_fusion': [], 'sparsity_reg': []
             }
+            losses_gnn = {
+                'all': [], 'Intrinsic': [], 'spurious_fusion': [], 'l1_reg': []
+            }
+            accs_mask = {}
+            accs_gnn = {}
 
-            # 保存损失均值
-            for k in losses_mask.keys():
-                if len(losses_mask[k]) > 0:
-                    train_res['mask'][k] = float(np.mean(losses_mask[k]))
+            lambda_reg = 0.1 * (1 + epoch / self.config['train']['num_epoch'])
+            stage_transition_epoch = self.config['train']['stage_transition_epoch']
+
+            for batch_idx, (data, _, label) in enumerate(train_loader):
+
+                is_first_batch_of_stage2 = (not is_stage1) and \
+                                           (epoch == stage_transition_epoch) and \
+                                           (batch_idx == 0)
+
+                if is_first_batch_of_stage2:
+                    logger.info(f"\n{'!'*80}")
+                    logger.info(f"DEBUG [Epoch {epoch+1}, Batch {batch_idx}]: === 正在进入 Stage 2 的第一个批次 ===")
+                    logger.info(f"{'!'*80}\n")
+
+                self.global_step += 1
+                label = label.to(self.device)
+
+                # ============ 按阶段构建数据和特征 ============
+                if is_stage1:
+                    data = data.to(self.device)
+                    x_features = self._extract_features(data) # [B, P, feature_dim]
                 else:
-                    train_res['mask'][k] = 0.0
+                    large_data, large_edge = self.large_graph_builder.build_large_graph(
+                        batch_data=data,
+                        batch_labels=label,
+                        base_edge=self.edge_prior_mask.cpu(),
+                        all_data=self.all_data,
+                        all_labels=self.all_labels
+                    )
+                    large_data = large_data.to(self.device)
+                    x_features = self._extract_features(large_data) # [B, (N+1)*P, feature_dim]
 
-            for k in losses_gnn.keys():
-                if len(losses_gnn[k]) > 0:
-                    train_res['gnn'][k] = float(np.mean(losses_gnn[k]))
+                    # ======== 排查点 1: 检查 Stage 2 的输入特征 (x_features) ========
+                    if is_first_batch_of_stage2:
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Stage 2 - x_features shape: {x_features.shape}")
+                        if torch.isnan(x_features).any():
+                            logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: x_features 中检测到 NaN!")
+                            raise ValueError("NaN found in features after _extract_features")
+                        if torch.isinf(x_features).any():
+                            logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: x_features 中检测到 Inf!")
+                            raise ValueError("Inf found in features after _extract_features")
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: x_features (排查点 1) 检查通过 (无 NaN/Inf).")
+
+
+                #========== 1. Mask训练 ==========
+                for param in self.model.parameters():
+                    param.requires_grad = False
+
+                mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
+                masks, sparsity = mask_module(train=True)
+
+                if is_stage1:
+                    result_mask = self._compute_stage1_mask_loss(
+                        x_features, masks, label, lambda_reg, self.edge_prior_mask, is_large_graph=False
+                    )
                 else:
-                    train_res['gnn'][k] = 0.0
+                    result_mask = self._compute_stage2_mask_loss(
+                        x_features, masks, label, lambda_reg, self.edge_prior_mask, is_large_graph=True
+                    )
 
-            # 保存准确率均值
-            for k, v in accs_mask.items():
-                if len(v) > 0:
-                    train_res['mask'][f'acc_{k}'] = float(np.mean(v))
+                    # ======== 排查点 2: 检查 Stage 2 的 Mask 损失值 (已修复) ========
+                    if is_first_batch_of_stage2:
+                        # 【修复】: 使用 _safe_get_item 辅助函数
+                        l_all = _safe_get_item(result_mask['loss'], 'all')
+                        l_inv = _safe_get_item(result_mask['loss'], 'spurious_fusion')
+                        l_sen = _safe_get_item(result_mask['loss'], 'intrinsic_fusion') # <-- 现在这里是安全的
+                        l_int = _safe_get_item(result_mask['loss'], 'Intrinsic')
+                        l_spa = _safe_get_item(result_mask['loss'], 'sparsity_reg')
+
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Stage 2 - Mask 损失 (Backward 之前):")
+                        logger.info(f"  ├─ Total Loss: {l_all:.4e}")
+                        logger.info(f"  ├─ L_Intrinsic: {l_int:.4e}")
+                        logger.info(f"  ├─ L_spurious_fusion (L_inv): {l_inv:.4e}")
+                        logger.info(f"  ├─ L_intrinsic_fusion (L_sen): {l_sen:.4e}") # <-- 重点观察对象 (应为 0.0)
+                        logger.info(f"  └─ L_Sparsity: {l_spa:.4e}")
+
+                        if not np.isfinite(l_all):
+                            logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: Mask 损失值为 NaN/Inf！")
+                            raise ValueError("Mask loss exploded before backward")
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Mask 损失 (排查点 2) 检查通过 (有限值).")
+
+
+                self.optimizer_mask.zero_grad()
+                # 只有当 'all' 键存在且是张量时才进行反向传播
+                if 'all' in result_mask['loss'] and isinstance(result_mask['loss']['all'], torch.Tensor):
+                    result_mask['loss']['all'].backward()
                 else:
-                    train_res['mask'][f'acc_{k}'] = 0.0
+                    logger.warning(f"DEBUG [E{epoch+1}, B{batch_idx}]: 'all' 损失不是张量，跳过 Mask backward。")
 
-            for k, v in accs_gnn.items():
-                if len(v) > 0:
-                    train_res['gnn'][f'acc_{k}'] = float(np.mean(v))
+                # ======== 排查点 3: 检查 Stage 2 的 Mask 梯度 ========
+                if is_first_batch_of_stage2:
+                    max_grad_norm = 0.0
+                    nan_grad = False
+                    inf_grad = False
+                    for param in self.mask.parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any(): nan_grad = True
+                            if torch.isinf(param.grad).any(): inf_grad = True
+                            current_norm = param.grad.data.norm(2).item()
+                            if current_norm > max_grad_norm:
+                                max_grad_norm = current_norm
+
+                    logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Stage 2 - Mask 梯度 (Backward 之后):")
+                    logger.info(f"  ├─ 最大梯度范数 (Max Grad Norm): {max_grad_norm:.4e}")
+
+                    if nan_grad or inf_grad:
+                        logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: Mask 梯度中检测到 NaN/Inf！")
+                        raise ValueError("Mask gradients exploded (NaN/Inf)")
+                    logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Mask 梯度 (排查点 3) 检查通过 (无 NaN/Inf).")
+
+                self.optimizer_mask.step()
+
+                # (记录 Mask 损失)
+                for k in losses_mask.keys():
+                    losses_mask[k].append(_safe_get_item(result_mask['loss'], k)) # 【修复】使用 safe_get
+                for k, v in result_mask['preds'].items():
+                    if k not in accs_mask: accs_mask[k] = []
+                    accs_mask[k].append(self._compute_accuracy(v, label))
+
+
+                #========== 2. GNN训练 ==========
+                for param in self.model.parameters():
+                    param.requires_grad = True
+
+                masks, sparsity = mask_module(train=False) # 使用更新后的 Mask
+                masks = [m.detach() for m in masks]
+
+                if is_stage1:
+                    result_gnn = self._compute_stage1_gnn_loss(
+                        x_features, masks, label, self.edge_prior_mask, is_large_graph=False
+                    )
                 else:
-                    train_res['gnn'][f'acc_{k}'] = 0.0
+                    result_gnn = self._compute_stage2_gnn_loss(
+                        x_features, masks, label, self.edge_prior_mask, is_large_graph=True
+                    )
 
-            self.epoch_results[epoch]['train'] = train_res
+                    # ======== 排查点 4: 检查 Stage 2 的 GNN 损失和L1 (已修复) ========
+                    if is_first_batch_of_stage2:
+                        # 【修复】: 使用 _safe_get_item 辅助函数
+                        l1_reg_val = _safe_get_item(result_gnn['loss'], 'l1_reg')
+
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Stage 2 - GNN L1 Reg (Backward 之前): {l1_reg_val:.4e}")
+
+                        if not np.isfinite(l1_reg_val):
+                             logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: GNN L1 Reg 值为 NaN/Inf！...")
+                             raise ValueError("GNN weights (L1 Reg) exploded")
+
+                        # 【修复】: 检查 GNN 的总损失
+                        l_all_gnn = _safe_get_item(result_gnn['loss'], 'all')
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Stage 2 - GNN Total Loss (Backward 之前): {l_all_gnn:.4e}")
+
+                        if not np.isfinite(l_all_gnn):
+                            logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: GNN 损失值为 NaN/Inf！(Mask 损坏导致)")
+                            raise ValueError("GNN loss exploded (likely due to corrupted mask)")
+
+                        logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: GNN 损失 (排查点 4) 检查通过。")
+
+
+                # 只有当 'all' 键存在且是张量时才进行反向传播
+                if 'all' in result_gnn['loss'] and isinstance(result_gnn['loss']['all'], torch.Tensor):
+                    result_gnn['loss']['all'].backward()
+                else:
+                    logger.warning(f"DEBUG [E{epoch+1}, B{batch_idx}]: 'all' 损失不是张量，跳过 GNN backward。")
+
+                # ======== 排查点 5: 检查 Stage 2 的 GNN 梯度 ========
+                if is_first_batch_of_stage2:
+                    max_grad_norm_gnn = 0.0
+                    nan_grad_gnn = False
+                    inf_grad_gnn = False
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any(): nan_grad_gnn = True
+                            if torch.isinf(param.grad).any(): inf_grad_gnn = True
+                            current_norm = param.grad.data.norm(2).item()
+                            if current_norm > max_grad_norm_gnn:
+                                max_grad_norm_gnn = current_norm
+
+                    logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: Stage 2 - GNN 梯度 (Backward 之后):")
+                    logger.info(f"  ├─ 最大梯度范数 (Max Grad Norm): {max_grad_norm_gnn:.4e}")
+
+                    if nan_grad_gnn or inf_grad_gnn:
+                        logger.error(f"FATAL [E{epoch+1}, B{batch_idx}]: GNN 梯度中检测到 NaN/Inf！")
+                        raise ValueError("GNN gradients exploded (NaN/Inf)")
+                    logger.info(f"DEBUG [E{epoch+1}, B{batch_idx}]: GNN 梯度 (排查点 5) 检查通过 (无 NaN/Inf).")
+
+                self.optimizer.step()
+
+                # (记录 GNN 损失)
+                for k in losses_gnn.keys():
+                    losses_gnn[k].append(_safe_get_item(result_gnn['loss'], k)) # 【修复】使用 safe_get
+                for k, v in result_gnn['preds'].items():
+                    if k not in accs_gnn: accs_gnn[k] = []
+                    accs_gnn[k].append(self._compute_accuracy(v, label))
+
+                if self.rank == 0:
+                    self.current_mask_sums = {
+                        'node': masks[0].sum().item(),
+                        'edge': masks[1].sum().item()
+                    }
+
+            # ============ Epoch 结束，保存结果 ============
+            if self.rank == 0:
+                train_res = {'mask': {}, 'gnn': {}}
+
+                for k in losses_mask.keys():
+                    train_res['mask'][k] = float(np.mean(losses_mask[k])) if len(losses_mask[k]) > 0 else 0.0
+                for k in losses_gnn.keys():
+                    train_res['gnn'][k] = float(np.mean(losses_gnn[k])) if len(losses_gnn[k]) > 0 else 0.0
+                for k, v in accs_mask.items():
+                    train_res['mask'][f'acc_{k}'] = float(np.mean(v)) if len(v) > 0 else 0.0
+                for k, v in accs_gnn.items():
+                    train_res['gnn'][f'acc_{k}'] = float(np.mean(v)) if len(v) > 0 else 0.0
+
+                self.epoch_results[epoch]['train'] = train_res
     
     def _eval_main_epoch(self, epoch: int, data_loader: DataLoader, phase: str):
         """主训练评估"""
@@ -669,7 +751,6 @@ class CausalTrainer:
         # 内在子图干扰
         y_sen = model.prediction_intrinsic_fusion(x, edge_prior_mask, masks, is_large_graph)
         loss_sen = self.criterion(y_sen, 1 - label).mean()
-        
         # 稀疏性正则
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
         reg_loss = mask_module.compute_sparsity_regularization(lambda_reg=lambda_reg)

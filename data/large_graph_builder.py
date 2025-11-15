@@ -156,30 +156,33 @@ class LargeGraphBuilder:
         N = self.num_neg_samples
         device = batch_data.device
 
-        # batch_data shape: [B, P, 1, D, H, W]
-        # 直接使用相同的shape
         data_shape = batch_data.shape[2:]  # [1, D, H, W]
 
-        # 初始化大图数据
         large_data = torch.zeros(
             (B, (N + 1) * P, *data_shape),
             dtype=batch_data.dtype,
             device=device
         )
 
-        # 填充数据
         for i in range(B):
-            # 第一块：原始锚点样本
+            # 第一块：原始锚点样本（已经在 Dataset.__getitem__ 中归一化过了）
             large_data[i, :P] = batch_data[i]
 
             # 后N块：负样本
             for neg_idx, global_idx in enumerate(neg_indices_list[i]):
                 start = (neg_idx + 1) * P
                 end = (neg_idx + 2) * P
-                # all_data shape: [N, P, D, H, W] - 没有通道维度
+
+                # 从原始数据读取
                 neg_sample = torch.from_numpy(
                     all_data[global_idx].copy()
-                ).to(device).float()
+                ).to(device).float()  # Shape: [P, D, H, W]
+
+                # ✅ 【关键修复】对负样本进行 Z-Score 归一化
+                # 这样才能和 Anchor 样本保持一致（Anchor 在 Dataset.__getitem__ 中归一化过）
+                neg_mean = neg_sample.mean()
+                neg_std = neg_sample.std()
+                neg_sample = (neg_sample - neg_mean) / (neg_std + 1e-6)
 
                 # 添加通道维度: [P, D, H, W] -> [P, 1, D, H, W]
                 neg_sample = neg_sample.unsqueeze(1)
