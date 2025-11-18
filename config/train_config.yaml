@@ -1,11 +1,11 @@
 # =====================================================
-# 统一训练配置文件
+# 统一训练配置文件（优化版）
 # =====================================================
 
 # 基本配置
 exp_name: refactored_experiment
-split_seed: 1449
-seed: 909
+split_seed: 42
+seed: 42
 
 # 数据配置
 data:
@@ -17,17 +17,17 @@ data:
 # 缓存管理配置
 cache:
   base_dir: ./cache
-  auto_clean: false  # 是否自动清理旧缓存
+  auto_clean: false
 
 # DenseNet预训练配置
 densenet:
   pretrain:
     num_epochs: 70
-    batch_size: 24
+    batch_size: 48        # 🔧 增加批次大小 (每GPU 16个)
     learning_rate: 0.0005
     weight_decay: 0.0001
-    num_workers: 4
-    'patience': 40
+    num_workers: 16       # 🔧 增加数据加载线程 (4倍GPU数)
+    patience: 40
   model:
     growth_rate: 8
     num_init_features: 24
@@ -35,31 +35,32 @@ densenet:
 # 图边构建配置
 graph:
   build:
-    similarity_threshold: 0.9    # patch间相似度阈值
-    frequency_threshold: 0.5     # 边在患者中的最小出现频率
-    similarity_metric: cosine    # 相似度计算方式: cosine, euclidean
-    batch_size: 64              # 相似度计算批次大小
-    use_all_data: true          # 使用全部数据构建边（推荐）
+    k_neighbors: 20              
+    frequency_threshold: 0.3
+    similarity_threshold: 0.7  # 双重筛选
+    similarity_metric: cosine
+    batch_size: 64
+    use_all_data: true
   params:
     node_type: px
     edge_type: abscorr
     dist_type: euc_1+gau
     adj_norm: DAD
 
+# 大图配置（对比学习）
 large_graph:
-  enabled: true              # 是否使用大图
-  num_neg_samples: 2         # 负样本数量
-  sampling_strategy: opposite_label  # 采样策略
-
+  enabled: true
+  num_neg_samples: 2
+  sampling_strategy: opposite_label
 
 # 主训练配置
 train:
-  folds: [0, 1, 2, 3, 4]        # 要训练的fold列表
+  folds: [0, 1, 2, 3, 4]
   pre_epoch: 60
   num_epoch: 140
   stage_transition_epoch: 100
-  batch_size: 33
-  test_batch_size: 33
+  batch_size: 72          # 🔧 增加批次大小 (每GPU 24个)
+  test_batch_size: 66
   
   # 优化器
   optimizer: SGD
@@ -68,17 +69,21 @@ train:
   weight_decay: 0.0005
   nesterov: true
   scheduler: auto
-  stepsize: 10
-  gamma: 0.5
+  stepsize: 20
+  gamma: 0.7
+  
+  # 稀疏度正则化预热（新增）
+  sparsity_warmup_epochs: 10
   
   # 损失权重
   loss_weights:
-    L_inv: 1      # 因果损失
-    L_sen: 1      # 反事实损失
-    L_pred: 1     # 不变性损失
-    L_spu: 1     # 变异性损失
-    LG: 0.002  # 引导损失
-    lambda_l1: 0.0001  # L1正则化
+    L_inv: 1
+    L_sen: 1
+    L_pred: 1
+    L_spu: 1
+    LG: 0.002
+    lambda_l1: 0.0001
+    lambda_sparsity: 0.2  
 
 # 模型配置
 model:
@@ -91,7 +96,7 @@ model:
 
 # 其他配置
 misc:
-  device: [0]          # GPU设备索引
+  device: [0, 1, 2]
   gumble_tau: 1
   log_interval: 100
   save_interval: 5

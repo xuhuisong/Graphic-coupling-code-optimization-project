@@ -23,7 +23,8 @@ from models.causal_net import CausalNet
 from models.causal_mask import CausalMask
 from data.large_graph_builder import LargeGraphBuilder
 from utils.metrics import compute_binary_metrics
-
+from utils.mask_monitor import MaskMonitor
+from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +69,14 @@ class CausalTrainer:
             param.requires_grad = False
         self.densenet_model.eval()
         
+        if torch.cuda.device_count() > 1:
+            num_gpus = torch.cuda.device_count()
+            logger.info(f"🎮 Wrapping DenseNet with DataParallel across {num_gpus} GPUs for feature extraction")
+            self.densenet_model = nn.DataParallel(self.densenet_model)
+            self.feature_extract_batch_size = 64 * num_gpus  # 每GPU 64个patch
+        else:
+            self.feature_extract_batch_size = 32
+        
         # 模型和优化器（延迟初始化）
         self.model = None
         self.mask = None
@@ -108,37 +117,54 @@ class CausalTrainer:
         self.lambda_l1 = config['train']['loss_weights']['lambda_l1']
         
         logger.info(f"✅ Trainer initialized for Fold {fold}")
+        # 添加 Mask 监控器
+        self.mask_monitor = MaskMonitor(
+            save_dir=str(Path(work_dir).parent),  # experiments/exp_name/
+            fold=fold
+        )
+        
+        logger.info(f"✅ Trainer initialized for Fold {fold}")
     
     # ============================================================================
     # 模型和优化器初始化
     # ============================================================================
-    
+
     def _build_models(self):
         """构建因果图神经网络和掩码模型"""
+        # 🔧 兼容DataParallel的feature_dim获取
+        if isinstance(self.densenet_model, nn.DataParallel):
+            feature_dim = self.densenet_model.module.feature_dim
+        else:
+            feature_dim = self.densenet_model.feature_dim
+
         # 主GNN模型
         self.model = CausalNet(
             num_class=2,
-            feature_dim=self.densenet_model.feature_dim,
+            feature_dim=feature_dim,
             hidden1=self.config['model']['args']['hidden1'],
             hidden2=self.config['model']['args']['hidden2'],
             kernels=self.config['model']['args'].get('kernels', [2]),
             num_patches=self.edge_prior_mask.shape[0],
             num_neg_samples=self.config['large_graph']['num_neg_samples']
         ).to(self.device)
-        
-        # 因果掩码模型（简洁版 - 无目标稀疏度）
+
+        # 因果掩码模型
         self.mask = CausalMask(
             num_patches=self.edge_prior_mask.shape[0], 
             edge_matrix=self.edge_prior_mask,    
             gumble_tau=self.config['misc']['gumble_tau']
         ).to(self.device)
-        
+
         # 多GPU并行
         if torch.cuda.device_count() > 1:
+            logger.info(f"🎮 Wrapping CausalNet and Mask with DataParallel across {torch.cuda.device_count()} GPUs")
             self.model = nn.DataParallel(self.model)
             self.mask = nn.DataParallel(self.mask)
-        
+            logger.info(f"   Model device_ids: {list(range(torch.cuda.device_count()))}")
+            logger.info(f"   Expected GPU memory usage will be distributed")
+
         logger.info("✅ Models built")
+ 
     
     def _setup_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -587,6 +613,51 @@ class CausalTrainer:
         metrics = compute_binary_metrics(all_outputs, all_labels)
         self.epoch_results[epoch][phase] = metrics
 
+        # ========== 新增：保存 Mask Logits ==========
+        if self.rank == 0 and phase == 'val':  # 只在验证集评估后保存
+            mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
+
+            # 准备额外信息
+            additional_info = {
+                'val_acc': metrics['accuracy'],
+                'val_auc': metrics['auc'],
+                'val_f1': metrics['f1'],
+                'val_sensitivity': metrics['sensitivity'],
+                'val_specificity': metrics['specificity'],
+                'val_precision': metrics['precision'],
+            }
+
+            # 如果有测试集结果，也加入
+            if 'test' in self.epoch_results.get(epoch, {}):
+                test_metrics = self.epoch_results[epoch]['test']
+                additional_info.update({
+                    'test_acc': test_metrics['accuracy'],
+                    'test_auc': test_metrics['auc'],
+                    'test_f1': test_metrics['f1'],
+                    'test_sensitivity': test_metrics['sensitivity'],
+                    'test_specificity': test_metrics['specificity'],
+                    'test_precision': test_metrics['precision'],
+                })
+
+            # 添加训练损失信息（如果有）
+            if 'train' in self.epoch_results.get(epoch, {}):
+                train_res = self.epoch_results[epoch]['train']
+                mask_res = train_res.get('mask', {})
+                gnn_res = train_res.get('gnn', {})
+
+                additional_info.update({
+                    'train_mask_loss': mask_res.get('all', 0),
+                    'train_gnn_loss': gnn_res.get('all', 0),
+                    'train_sparsity_loss': mask_res.get('sparsity_reg', 0),
+                })
+
+            # 保存当前epoch的masks
+            self.mask_monitor.save_epoch_masks(
+                epoch=epoch,
+                mask_module=mask_module,
+                additional_info=additional_info
+            )
+
         # 仅在阶段2更新最终评估的最佳模型
         stage_transition = self.config['train']['stage_transition_epoch']
         if phase == 'val' and epoch >= stage_transition and metrics['accuracy'] > self.best_val_acc:
@@ -760,36 +831,44 @@ class CausalTrainer:
     # 辅助函数
     # ============================================================================
     
-    def _extract_features(self, data: torch.Tensor, batch_size: int = 32) -> torch.Tensor:
+    def _extract_features(self, data: torch.Tensor) -> torch.Tensor:
         """
-        使用冻结的DenseNet批量提取特征
-        
+        使用多GPU批量提取特征（优化版 - 消除CPU瓶颈）
+
         Args:
             data: 输入数据 [B, P, 1, D, H, W]
-            batch_size: 批处理大小（避免OOM）
-            
+
         Returns:
             特征张量 [B, P, feature_dim]
         """
         B = data.shape[0]
         total_P = data.shape[1]
 
+        # Reshape: [B, P, 1, D, H, W] -> [B*P, 1, D, H, W]
         data_reshaped = data.view(-1, 1, data.shape[3], data.shape[4], data.shape[5])
         total_patches = data_reshaped.shape[0]
 
-        # 批量提取，避免显存爆炸
+        # 🔧 优化：根据GPU数量动态调整批处理大小
+        batch_size = getattr(self, 'feature_extract_batch_size', 32)
+
         all_features = []
         with torch.no_grad():
             for i in range(0, total_patches, batch_size):
                 batch = data_reshaped[i:i+batch_size]
-                features_batch = self.densenet_model(batch)
-                all_features.append(features_batch.cpu())
-                del features_batch
-                torch.cuda.empty_cache()
 
-        # 在CPU上拼接，再移回GPU
-        features = torch.cat(all_features, dim=0).to(self.device)
+                # DataParallel会自动分配到各GPU
+                features_batch = self.densenet_model(batch)
+
+                # ✅ 关键优化：保持在GPU上，延迟CPU传输
+                all_features.append(features_batch)
+
+                # ❌ 移除频繁的empty_cache（会阻塞GPU）
+                # torch.cuda.empty_cache()  # 删除这行
+
+        # ✅ 在GPU上拼接（避免多次CPU-GPU传输）
+        features = torch.cat(all_features, dim=0)
         features = features.view(B, total_P, -1)
+
         return features
     
     def _compute_l1_regularization(self) -> torch.Tensor:
@@ -955,6 +1034,28 @@ class CausalTrainer:
             'test_acc': self.best_test_acc
         }
 
+        # ========== 新增：生成 Mask 分析报告 ==========
+        if self.rank == 0:
+            logger.info("\n" + "-"*80)
+            logger.info("📊 Generating Mask Analysis Reports...")
+            logger.info("-"*80)
+
+            try:
+                # 保存摘要
+                self.mask_monitor.save_summary()
+
+                # 生成分析报告
+                self.mask_monitor.generate_analysis_report()
+
+                logger.info("✅ Mask analysis completed")
+                logger.info(f"   Summary saved: {self.mask_monitor.fold_dir / 'masks_summary.csv'}")
+                logger.info(f"   Report saved: {self.mask_monitor.fold_dir / 'mask_analysis_report.txt'}")
+                logger.info(f"   Detailed masks: {self.mask_monitor.mask_dir}/")
+
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to generate mask analysis: {str(e)}")
+
+        logger.info("\n" + "-"*80)
         logger.info(f"Best Epoch:    {self.best_epoch + 1}")
         logger.info(f"Best Val Acc:  {self.best_val_acc:.4f}")
         logger.info(f"Best Test Acc: {self.best_test_acc:.4f}")

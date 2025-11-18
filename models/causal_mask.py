@@ -96,34 +96,40 @@ class CausalMask(nn.Module):
         return node_sparsity, edge_sparsity
     
     def forward(self, train=True, return_probs=False):
-        """
-        前向传播
-        
-        Returns:
-            如果return_probs=False: ([node_mask, edge_mask], (node_sparsity, edge_sparsity))
-            如果return_probs=True: ([node_mask, edge_mask], [node_probs, edge_probs], (node_sparsity, edge_sparsity))
-        """
         if train:
-            # 训练：Gumbel-Softmax
             node_mask_hard = self.gumbel_softmax(self.node_mask, tau=self.tau, hard=True)
-            edge_mask_hard = self.gumbel_softmax(self.edge_mask, tau=self.tau, hard=True) * self.learnable_mask
+            edge_mask_hard = self.gumbel_softmax(self.edge_mask, tau=self.tau, hard=True)
+
+            # 【新增】强制对称
+            edge_mask_hard = torch.triu(edge_mask_hard, diagonal=1)  # 只保留上三角
+            edge_mask_hard = edge_mask_hard + edge_mask_hard.t()     # 对称复制
+            edge_mask_hard = edge_mask_hard * self.learnable_mask
         else:
-            # 评估：硬argmax
             node_mask_hard = self.hardmax(self.node_mask)
-            edge_mask_hard = self.hardmax(self.edge_mask) * self.learnable_mask
-        
+            edge_mask_hard = self.hardmax(self.edge_mask)
+
+            # 【新增】强制对称
+            edge_mask_hard = torch.triu(edge_mask_hard, diagonal=1)
+            edge_mask_hard = edge_mask_hard + edge_mask_hard.t()
+            edge_mask_hard = edge_mask_hard * self.learnable_mask
+
+        # 对角线置0
+        edge_mask_hard.fill_diagonal_(0)
+
         node_sparsity, edge_sparsity = self.calculate_sparsity(node_mask_hard, edge_mask_hard)
-        
+
         if return_probs:
-            node_probs_soft = F.softmax(self.node_mask, dim=-1)[:, 1]
-            edge_probs_soft = F.softmax(self.edge_mask, dim=-1)[:, :, 1]
-            edge_probs_soft = edge_probs_soft * self.learnable_mask
-            
+            # 概率也对称化
+            node_probs = F.softmax(self.node_mask, dim=-1)[:, 1]
+            edge_probs = F.softmax(self.edge_mask, dim=-1)[:, :, 1]
+            edge_probs = torch.triu(edge_probs, diagonal=1) + torch.triu(edge_probs, diagonal=1).t()
+            edge_probs = edge_probs * self.learnable_mask
+
             return ([node_mask_hard, edge_mask_hard], 
-                    [node_probs_soft, edge_probs_soft], 
+                    [node_probs, edge_probs], 
                     (node_sparsity, edge_sparsity))
-        else:
-            return [node_mask_hard, edge_mask_hard], (node_sparsity, edge_sparsity)
+
+        return [node_mask_hard, edge_mask_hard], (node_sparsity, edge_sparsity)
     
     def compute_sparsity_regularization(
         self, 

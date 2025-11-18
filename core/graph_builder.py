@@ -217,52 +217,65 @@ class GraphBuilder:
     def _compute_patient_edges(self, all_features: np.ndarray) -> np.ndarray:
         """
         计算每个患者内部的边
-        
-        对于每个患者，计算其所有patch对之间的相似度，
-        根据阈值生成该患者的邻接矩阵
-        
+
+        [修改] 使用 TOP-K 策略替代固定阈值
+
         Args:
             all_features: 所有特征 [N, P, feature_dim]
-            
+
         Returns:
-            患者边矩阵 [N, P, P]，每个元素为0或1
+            患者边矩阵 [N, P, P]
         """
         num_patients, num_patches, feature_dim = all_features.shape
-        
+
         # 初始化结果
         patient_edges = np.zeros((num_patients, num_patches, num_patches), dtype=np.uint8)
-        
+
         device = torch.device(self.config['device'])
-        similarity_threshold = self.config['similarity_threshold']
-        similarity_metric = self.config['similarity_metric']
-        
+
+        # 【修改】使用 TOP-K 替代阈值
+        k_neighbors = self.config.get('k_neighbors', 20)  # 每个节点保留TOP-20邻居
+
         logger.info(f"Computing edges for {num_patients} patients...")
-        logger.info(f"Using {similarity_metric} similarity with threshold {similarity_threshold}")
-        
-        # 逐患者计算（避免显存溢出）
+        logger.info(f"Using TOP-K strategy with K={k_neighbors}")
+
+        # 逐患者计算
         for i in tqdm(range(num_patients), desc="Computing patient edges"):
             patient_features = torch.FloatTensor(all_features[i]).to(device)  # [P, feature_dim]
-            
+
             # 计算相似度矩阵
-            if similarity_metric == 'cosine':
+            if self.config['similarity_metric'] == 'cosine':
                 similarity_matrix = self._compute_cosine_similarity(patient_features)
-            elif similarity_metric == 'euclidean':
+            elif self.config['similarity_metric'] == 'euclidean':
                 similarity_matrix = self._compute_euclidean_similarity(patient_features)
             else:
-                raise ValueError(f"Unknown similarity metric: {similarity_metric}")
-            
-            # 应用阈值生成边
-            edges = (similarity_matrix >= similarity_threshold).cpu().numpy().astype(np.uint8)
-            
-            # 移除自环（对角线设为0）
-            np.fill_diagonal(edges, 0)
-            
-            patient_edges[i] = edges
-        
+                raise ValueError(f"Unknown similarity metric: {self.config['similarity_metric']}")
+
+            # 【关键修改】TOP-K 选择
+            # 对每一行（每个节点），找到最相似的K个邻居
+            topk_values, topk_indices = torch.topk(similarity_matrix, k=k_neighbors+1, dim=1)
+            # +1 是因为自己和自己相似度最高，需要排除
+
+            # 构建稀疏边矩阵
+            edges = torch.zeros_like(similarity_matrix, dtype=torch.uint8)
+            for node_idx in range(num_patches):
+                neighbors = topk_indices[node_idx, 1:]
+                # 【新增】同时满足TOP-K和阈值
+                for neighbor in neighbors:
+                    if similarity_matrix[node_idx, neighbor] >= self.config['similarity_threshold']:
+                        edges[node_idx, neighbor] = 1
+
+            # 互选
+            edges = edges & edges.t()
+            edges.fill_diagonal_(0)
+
+            patient_edges[i] = edges.cpu().numpy()
+
         # 统计信息
         avg_edges_per_patient = np.mean([np.sum(patient_edges[i]) for i in range(num_patients)])
         logger.info(f"Average edges per patient: {avg_edges_per_patient:.1f}")
-        
+        logger.info(f"Theoretical max (K={k_neighbors}, undirected): {num_patches * k_neighbors}")
+
         return patient_edges
     
     def _compute_cosine_similarity(self, features: torch.Tensor) -> torch.Tensor:

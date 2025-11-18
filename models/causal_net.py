@@ -59,82 +59,57 @@ class GCNBlock(nn.Module):
         self.conv2 = GCN(in_features=self.hidden[0], out_features=self.hidden[-1])
         self.dropout2 = nn.Dropout(dropout_p)
     
-    def forward(self, x: torch.Tensor, edge1: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge1: torch.Tensor, node_mask: torch.Tensor = None) -> torch.Tensor:
         """
-        只处理子图内部的卷积
-        
         Args:
-            x: 节点特征 [B, P, d]
-            edge1: 子图内部边 [B, P, P]
+            node_mask: [P] 或 None (prediction_whole不需要mask)
         """
-        # ========== 第一层 ==========
-        edge1_norm = self._normalize_adj_batch(edge1)
+        edge1_norm = self._normalize_adj_batch(edge1, node_mask)
+
         x = self.conv1(x, edge1_norm)
-        # 移除了 F.relu 和 bn
         x = self.dropout1(x)
-        
-        # ========== 第二层 ==========
-        # 注意：第二层卷积仍然使用第一层归一化后的邻接矩阵
-        x = self.conv2(x, edge1_norm) 
-        # 移除了 F.relu 和 bn
+
+        x = self.conv2(x, edge1_norm)
         x = self.dropout2(x)
-        
+
         return x
     
-    @staticmethod
-    def _normalize_adj_batch(adj: torch.Tensor) -> torch.Tensor:
-        """
-        对称归一化邻接矩阵 (A + I)
-        (这个函数保持不变)
-        """
-        batch_size, num_nodes = adj.shape[0], adj.shape[1]
-        adj_clone = adj.clone()
-
-        # 1. 强制清空对角线（移除任何已有的自环）
-        diag_indices = torch.arange(num_nodes, device=adj.device)
-        adj_clone[:, diag_indices, diag_indices] = 0
-        
-        # 2. 添加自环（统一权重为1）
-        identity = torch.eye(num_nodes, device=adj.device).unsqueeze(0)
-        adj_with_self_loops = adj_clone + identity
-
-        # 3. 计算度
-        degree = adj_with_self_loops.sum(dim=2) # [B, P]
-
-        # 4. D^{-1/2}
-        degree_inv_sqrt = torch.pow(degree, -0.5)
-        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0 # 处理孤立节点
-
-        # 5. 对称归一化: D^{-1/2} * A * D^{-1/2}
-        adj_normalized = (degree_inv_sqrt.unsqueeze(2) * adj_with_self_loops * degree_inv_sqrt.unsqueeze(1))
-
-        return adj_normalized
     
     @staticmethod
-    def _normalize_adj_batch(adj: torch.Tensor) -> torch.Tensor:
+    def _normalize_adj_batch(adj: torch.Tensor, node_mask: torch.Tensor = None) -> torch.Tensor:
         """
-        对称归一化邻接矩阵 (A + I)
+        对称归一化邻接矩阵，考虑节点mask
+
+        Args:
+            adj: [B, P, P]
+            node_mask: [P] 节点mask (1=保留, 0=删除)
         """
         batch_size, num_nodes = adj.shape[0], adj.shape[1]
         adj_clone = adj.clone()
 
-        # 1. 强制清空对角线（移除任何已有的自环）
+        # 【新增】如果有node_mask，屏蔽被mask掉的节点的边
+        if node_mask is not None:
+            valid_mask = node_mask.view(1, -1, 1) * node_mask.view(1, 1, -1)  # [1, P, P]
+            adj_clone = adj_clone * valid_mask  # 无效节点的边权重置0
+
+        # 清空对角线
         diag_indices = torch.arange(num_nodes, device=adj.device)
         adj_clone[:, diag_indices, diag_indices] = 0
-        
-        # 2. 添加自环（统一权重为1）
+
+        # 添加自环
         identity = torch.eye(num_nodes, device=adj.device).unsqueeze(0)
         adj_with_self_loops = adj_clone + identity
 
-        # 3. 计算度
-        degree = adj_with_self_loops.sum(dim=2) # [B, P]
+        # 计算度（只计算有效边）
+        degree = adj_with_self_loops.sum(dim=2)  # [B, P]
 
-        # 4. D^{-1/2}
+        # D^{-1/2}
         degree_inv_sqrt = torch.pow(degree, -0.5)
-        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0 # 处理孤立节点
+        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0.0
 
-        # 5. 对称归一化: D^{-1/2} * A * D^{-1/2}
-        adj_normalized = (degree_inv_sqrt.unsqueeze(2) * adj_with_self_loops * degree_inv_sqrt.unsqueeze(1))
+        # 对称归一化
+        adj_normalized = (degree_inv_sqrt.unsqueeze(2) * adj_with_self_loops * 
+                          degree_inv_sqrt.unsqueeze(1))
 
         return adj_normalized
 
@@ -253,82 +228,61 @@ class CausalNet(nn.Module):
         
         return large_edges
     
-    def prediction_whole(
-        self,
-        x_new: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        is_large_graph: bool = True
-    ) -> torch.Tensor:
-        """
-        全图预测 - 使用动态计算的边矩阵 (已更新)
-        """
+    def prediction_whole(self, x_new, edge_prior_mask, is_large_graph=True):
         edge = self.compute_dynamic_edges(x_new, edge_prior_mask, is_large_graph)
-        
-        # 【更新】使用 GCNBlock
-        xs = self.gcn_block(x_new, edge)
-        
+        xs = self.gcn_block(x_new, edge, node_mask=None)  # 无mask
         graph = readout(xs)
         return self.mlp_causal(graph)
-    
-    def prediction_intrinsic_path(
-        self,
-        x_new: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        masks: Tuple[torch.Tensor, torch.Tensor],
-        is_large_graph: bool = True
-    ) -> torch.Tensor:
-        """
-        因果不变性预测（内在路径）(已更新)
-        """
+
+    def prediction_intrinsic_path(self, x_new, edge_prior_mask, masks, is_large_graph=True):
         node_mask, edge_mask = masks
-        
         edge = self.compute_dynamic_edges(x_new, edge_prior_mask, is_large_graph)
-        
+
         if is_large_graph:
             P = self.num_patches
             x_orig = x_new[:, :P, :].clone()
             edge_orig = edge[:, :P, :P].clone()
-            
             x_masked = x_orig * node_mask.unsqueeze(0).unsqueeze(-1)
             inter_node_adj = edge_orig * edge_mask.unsqueeze(0)
-            
-            # 【更新】使用 GCNBlock
-            xs = self.gcn_block(x_masked, inter_node_adj)
+            xs = self.gcn_block(x_masked, inter_node_adj, node_mask)  # ✅
         else:
             x_masked = x_new * node_mask.unsqueeze(0).unsqueeze(-1)
             inter_node_adj = edge * edge_mask.unsqueeze(0)
-            
-            # 【更新】使用 GCNBlock
-            xs = self.gcn_block(x_masked, inter_node_adj)
-        
+            xs = self.gcn_block(x_masked, inter_node_adj, node_mask)  # ✅
+
         graph = readout(xs)
         return self.mlp_causal(graph)
-    
-    def prediction_spurious_path(
-        self,
-        x_new: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        masks: Tuple[torch.Tensor, torch.Tensor],
-        is_large_graph: bool = True
-    ) -> torch.Tensor:
-        """
-        因果变异性预测（虚假路径）(已更新)
-        """
+
+    def prediction_spurious_path(self, x_new, edge_prior_mask, masks, is_large_graph=True):
         node_mask, edge_mask = masks
-        
         edge = self.compute_dynamic_edges(x_new, edge_prior_mask, is_large_graph)
-        
+
         causal_mask = node_mask.unsqueeze(0).unsqueeze(-1)
         x_perturbed = x_new * (1 - causal_mask)
-        
+
         causal_edge_mask = edge_mask.unsqueeze(0)
         edge_perturbed = edge * (1 - causal_edge_mask)
-        
-        # 【更新】使用 GCNBlock
-        xs = self.gcn_block(x_perturbed, edge_perturbed)
-        
+
+        # ✅ 传入反向mask (1-node_mask)
+        spurious_node_mask = 1 - node_mask
+        xs = self.gcn_block(x_perturbed, edge_perturbed, spurious_node_mask)
+
         graph = readout(xs)
         return self.mlp_causal(graph)
+
+    def prediction_spurious_fusion(self, x, edge_prior_mask, masks, is_large_graph=True):
+        return self._perform_fusion_replacement(
+            x, edge_prior_mask, masks,
+            fusion_type="spurious",
+            is_large_graph=is_large_graph
+        )
+
+    def prediction_intrinsic_fusion(self, x, edge_prior_mask, masks, is_large_graph=True):
+        return self._perform_fusion_replacement(
+            x, edge_prior_mask, masks,
+            fusion_type="intrinsic",
+            is_large_graph=is_large_graph
+        )
 
     # -----------------------------------------------------------------
     # 【全新】替换式融合 (Replacement Fusion) 逻辑
@@ -418,278 +372,4 @@ class CausalNet(nn.Module):
         logits = self.mlp_causal(graph)
         
         return logits
-    '''
-    def _perform_fusion_replacement(
-        self,
-        x: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        masks: Tuple[torch.Tensor, torch.Tensor],
-        fusion_type: str, # "intrinsic" 或 "spurious"
-        is_large_graph: bool = True
-    ) -> torch.Tensor:
-        """
-        【新】执行替换式融合的私有辅助函数
-
-        流程:
-        1. 对大图中的所有子图（Anchor + Negatives）执行内部GCN（阶段一）。
-        2. 聚合所有负样本（Negatives）的特征，得到 "替换源" 特征。
-        3. 根据 fusion_type，有条件地用 "替换源" 替换 Anchor 的 "因果" 或 "虚假" 节点。
-        4. 对被替换后的 Anchor 图进行预测。
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        node_mask, edge_mask = masks
-
-        if not is_large_graph:
-            raise ValueError("替换式融合 (Replacement Fusion) 需要大图模式")
-
-        B, large_P, d = x.shape
-        P = self.num_patches
-
-        if large_P % P != 0:
-            raise ValueError(f"大图节点数 ({large_P}) 不是 P ({P}) 的整数倍")
-
-        num_subgraphs = large_P // P
-        num_neg_samples = num_subgraphs - 1
-
-        if num_neg_samples == 0:
-             raise ValueError("替换式融合需要至少一个负样本")
-
-        # ========================================================================
-        # 🔍 调试点1: 检查输入特征
-        # ========================================================================
-        logger.info(f"")
-        logger.info(f"{'='*80}")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 开始替换式融合")
-        logger.info(f"{'='*80}")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 输入特征 x 统计信息:")
-        logger.info(f"  ├─ Shape: {x.shape}")
-        logger.info(f"  ├─ Mean: {x.mean().item():.6f}, Std: {x.std().item():.6f}")
-        logger.info(f"  ├─ Min: {x.min().item():.6f}, Max: {x.max().item():.6f}")
-        logger.info(f"  ├─ 是否有 NaN: {torch.isnan(x).any().item()}")
-        logger.info(f"  ├─ 是否有 Inf: {torch.isinf(x).any().item()}")
-
-        # ========================================================================
-        # 🔍 调试点: 检查 edge_mask 的值分布
-        # ========================================================================
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: edge_mask 详细统计:")
-        logger.info(f"  ├─ Shape: {edge_mask.shape}")
-        logger.info(f"  ├─ Dtype: {edge_mask.dtype}")
-        logger.info(f"  ├─ Min: {edge_mask.min().item():.6f}")
-        logger.info(f"  ├─ Max: {edge_mask.max().item():.6f}")
-        logger.info(f"  ├─ Mean: {edge_mask.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {edge_mask.std().item():.6f}")
-
-        # 统计不同阈值下的数量
-        logger.info(f"  ├─ 值 == 0 的数量: {(edge_mask == 0).sum().item()}")
-        logger.info(f"  ├─ 值 == 1 的数量: {(edge_mask == 1).sum().item()}")
-        logger.info(f"  ├─ 值 > 0 的数量: {(edge_mask > 0).sum().item()}")
-        logger.info(f"  ├─ 值 > 0.5 的数量: {(edge_mask > 0.5).sum().item()}")
-        logger.info(f"  ├─ 值 > 0.9 的数量: {(edge_mask > 0.9).sum().item()}")
-
-        # 显示一些实际的唯一值
-        unique_vals = torch.unique(edge_mask)
-        if len(unique_vals) <= 20:
-            logger.info(f"  ├─ 所有唯一值: {unique_vals.tolist()}")
-        else:
-            logger.info(f"  ├─ 前20个唯一值: {unique_vals[:20].tolist()}")
-            logger.info(f"  ├─ 唯一值总数: {len(unique_vals)}")
-
-        # ========================================================================
-        # ✅ 第1步：动态计算每个子图的边
-        # ========================================================================
-        full_dynamic_edges = self.compute_dynamic_edges(x, edge_prior_mask, is_large_graph=True)
-
-        # 🔍 调试点2: 检查动态边
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 动态边 full_dynamic_edges 统计:")
-        logger.info(f"  ├─ Shape: {full_dynamic_edges.shape}")
-        logger.info(f"  ├─ Mean: {full_dynamic_edges.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {full_dynamic_edges.std().item():.6f}")
-        logger.info(f"  ├─ Min: {full_dynamic_edges.min().item():.6f}")
-        logger.info(f"  ├─ Max: {full_dynamic_edges.max().item():.6f}")
-        logger.info(f"  ├─ 非零边数: {(full_dynamic_edges > 0).sum().item()}")
-        logger.info(f"  ├─ 总边数: {full_dynamic_edges.numel()}")
-
-        # 构建内部边掩码（只保留因果边）
-        intrinsic_edge_mask_large = torch.zeros(large_P, large_P, device=x.device)
-        for i in range(num_subgraphs):
-            start = i * P
-            end = (i + 1) * P
-            intrinsic_edge_mask_large[start:end, start:end] = edge_mask
-
-        internal_edges = full_dynamic_edges * intrinsic_edge_mask_large.unsqueeze(0)
-
-        # 🔍 调试点3: 检查内部边（应用掩码后）
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 内部边 internal_edges 统计:")
-        logger.info(f"  ├─ Shape: {internal_edges.shape}")
-        logger.info(f"  ├─ Mean: {internal_edges.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {internal_edges.std().item():.6f}")
-        logger.info(f"  ├─ Min: {internal_edges.min().item():.6f}")
-        logger.info(f"  ├─ Max: {internal_edges.max().item():.6f}")
-        logger.info(f"  ├─ 非零边数 (>0): {(internal_edges > 0).sum().item()}")
-        logger.info(f"  ├─ 非零边数 (>0.01): {(internal_edges > 0.01).sum().item()}")
-        logger.info(f"  ├─ 非零边数 (>0.1): {(internal_edges > 0.1).sum().item()}")
-        logger.info(f"  ├─ 非零边数 (>0.5): {(internal_edges > 0.5).sum().item()}")
-
-        # 计算理论值（用于对比）
-        expected_edges = (edge_mask > 0).sum().item() * num_subgraphs * B
-        logger.info(f"  ├─ 理论非零边数 (edge_mask>0 × {num_subgraphs} × {B}): {expected_edges}")
-
-        # ========================================================================
-        # ✅ 第2步：执行阶段一（所有子图的内部卷积）
-        # ========================================================================
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 执行 GCN Block...")
-
-        xs_stage1 = self.gcn_block(x, internal_edges)
-
-        # 🔍 调试点4: 检查GCN输出
-        logger.info(f"DEBUG [Fusion {fusion_type}]: GCN 输出 xs_stage1 统计:")
-        logger.info(f"  ├─ Shape: {xs_stage1.shape}")
-        logger.info(f"  ├─ Mean: {xs_stage1.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {xs_stage1.std().item():.6f}")
-        logger.info(f"  ├─ Min: {xs_stage1.min().item():.6f}")
-        logger.info(f"  ├─ Max: {xs_stage1.max().item():.6f}")
-        logger.info(f"  ├─ 是否有 NaN: {torch.isnan(xs_stage1).any().item()}")
-        logger.info(f"  ├─ 是否有 Inf: {torch.isinf(xs_stage1).any().item()}")
-
-        # ========================================================================
-        # ✅ 第3步：准备替换数据
-        # ========================================================================
-
-        # 1. 分离 Anchor 和 Negatives
-        x_anchor_s1 = xs_stage1[:, :P, :]  # Anchor特征 [B, P, d]
-        x_negs_s1 = xs_stage1[:, P:, :]  # 所有负样本特征 [B, N*P, d]
-
-        # 2. 重塑并聚合负样本
-        x_negs_s1_reshaped = x_negs_s1.reshape(B, num_neg_samples, P, d) # [B, N, P, d]
-
-        # 3. 计算用于替换的"聚合信息" (取平均)
-        x_replacement_info = torch.mean(x_negs_s1_reshaped, dim=1) # [B, P, d]
-
-        # 🔍 调试点5: 检查替换特征
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 替换特征统计:")
-        logger.info(f"  ├─ x_anchor_s1 Mean: {x_anchor_s1.mean().item():.6f}, Std: {x_anchor_s1.std().item():.6f}")
-        logger.info(f"  ├─ x_replacement_info Mean: {x_replacement_info.mean().item():.6f}, Std: {x_replacement_info.std().item():.6f}")
-        logger.info(f"  ├─ x_replacement_info Min: {x_replacement_info.min().item():.6f}, Max: {x_replacement_info.max().item():.6f}")
-
-        # ========================================================================
-        # ✅ 第4步：执行"条件替换"
-        # ========================================================================
-
-        # 准备掩码
-        mask_intrinsic = node_mask.reshape(1, P, 1).to(x.device) # 因果节点 [1, P, 1]
-        mask_spurious = (1 - mask_intrinsic)                     # 虚假节点 [1, P, 1]
-
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 掩码统计:")
-        logger.info(f"  ├─ node_mask shape: {node_mask.shape}")
-        logger.info(f"  ├─ mask_intrinsic 非零数: {(mask_intrinsic > 0).sum().item()}")
-        logger.info(f"  ├─ mask_spurious 非零数: {(mask_spurious > 0).sum().item()}")
-
-        if fusion_type == "intrinsic":
-            # 内在融合: Anchor的因果部分被替换，虚假部分保留
-            x_anchor_new = (x_replacement_info * mask_intrinsic) + \
-                           (x_anchor_s1 * mask_spurious)
-            logger.info(f"DEBUG [Fusion {fusion_type}]: 执行内在融合（替换因果节点）")
-
-        elif fusion_type == "spurious":
-            # 虚假融合: Anchor的虚假部分被替换，因果部分保留
-            x_anchor_new = (x_anchor_s1 * mask_intrinsic) + \
-                           (x_replacement_info * mask_spurious)
-            logger.info(f"DEBUG [Fusion {fusion_type}]: 执行虚假融合（替换虚假节点）")
-        else:
-            raise ValueError(f"未知的 fusion_type: {fusion_type}")
-
-        # 🔍 调试点6: 检查替换后的特征
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 替换后 x_anchor_new 统计:")
-        logger.info(f"  ├─ Shape: {x_anchor_new.shape}")
-        logger.info(f"  ├─ Mean: {x_anchor_new.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {x_anchor_new.std().item():.6f}")
-        logger.info(f"  ├─ Min: {x_anchor_new.min().item():.6f}")
-        logger.info(f"  ├─ Max: {x_anchor_new.max().item():.6f}")
-        logger.info(f"  ├─ 是否有 NaN: {torch.isnan(x_anchor_new).any().item()}")
-        logger.info(f"  ├─ 是否有 Inf: {torch.isinf(x_anchor_new).any().item()}")
-
-        # ========================================================================
-        # ✅ 第5步：使用被替换后的Anchor图进行预测
-        # ========================================================================
-        graph = readout(x_anchor_new) # x_anchor_new 是 [B, P, d]
-
-        # 🔍 调试点7: 检查 readout 后的特征
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: Readout 后的 graph 统计:")
-        logger.info(f"  ├─ Shape: {graph.shape}")
-        logger.info(f"  ├─ Mean: {graph.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {graph.std().item():.6f}")
-        logger.info(f"  ├─ Min: {graph.min().item():.6f}")
-        logger.info(f"  ├─ Max: {graph.max().item():.6f}")
-
-        logits = self.mlp_causal(graph)
-
-        # 🔍 调试点8: 检查最终的 logits
-        logger.info(f"")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 最终 logits 统计:")
-        logger.info(f"  ├─ Shape: {logits.shape}")
-        logger.info(f"  ├─ Mean: {logits.mean().item():.6f}")
-        logger.info(f"  ├─ Std: {logits.std().item():.6f}")
-        logger.info(f"  ├─ Min: {logits.min().item():.6f}")
-        logger.info(f"  ├─ Max: {logits.max().item():.6f}")
-        logger.info(f"  ├─ 是否有 NaN: {torch.isnan(logits).any().item()}")
-        logger.info(f"  ├─ 是否有 Inf: {torch.isinf(logits).any().item()}")
-
-        logger.info(f"{'='*80}")
-        logger.info(f"DEBUG [Fusion {fusion_type}]: 替换式融合结束")
-        logger.info(f"{'='*80}")
-        logger.info(f"")
-
-        return logits
-''' 
     
-    def prediction_spurious_fusion(
-        self,
-        x: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        masks: Tuple[torch.Tensor, torch.Tensor],
-        is_large_graph: bool = True
-    ) -> torch.Tensor:
-        """
-        【重构】
-        Spurious Fusion Graph (替换式) - 测试Invariance
-        
-        使用负样本的 *虚假节点* 特征，替换Anchor的 *虚假节点* 特征。
-        """
-        return self._perform_fusion_replacement(
-            x,
-            edge_prior_mask,
-            masks,
-            fusion_type="spurious",
-            is_large_graph=is_large_graph
-        )
-
-    def prediction_intrinsic_fusion(
-        self,
-        x: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        masks: Tuple[torch.Tensor, torch.Tensor],
-        is_large_graph: bool = True
-    ) -> torch.Tensor:
-        """
-        【重构】
-        Intrinsic Fusion Graph (替换式) - 测试Sensitivity
-        
-        使用负样本的 *因果节点* 特征，替换Anchor的 *因果节点* 特征。
-        """
-        return self._perform_fusion_replacement(
-            x,
-            edge_prior_mask,
-            masks,
-            fusion_type="intrinsic",
-            is_large_graph=is_large_graph
-        )
