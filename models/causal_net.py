@@ -166,47 +166,22 @@ class CausalNet(nn.Module):
     def compute_dynamic_edges(
         self,
         x: torch.Tensor,
-        edge_prior_mask: torch.Tensor,
-        is_large_graph: bool = False
+        edge_prior_mask: torch.Tensor
     ) -> torch.Tensor:
-        """
-        基于输入特征动态计算个性化边矩阵 (未改动)
-        """
-        B, total_P, d = x.shape
-        P = edge_prior_mask.shape[0]
-        
-        if is_large_graph:
-            num_subgraphs = total_P // P
-            all_edges = []
-            for i in range(num_subgraphs):
-                start = i * P
-                end = (i + 1) * P
-                sub_x = x[:, start:end, :]
-                
-                sub_x_norm = F.normalize(sub_x, p=2, dim=2)
-                sub_similarity = torch.bmm(sub_x_norm, sub_x_norm.transpose(1, 2))
-                sub_similarity = (sub_similarity + 1) / 2
-                
-                mask_expanded = edge_prior_mask.unsqueeze(0).expand(B, -1, -1)
-                sub_edges = sub_similarity * mask_expanded
-                
-                all_edges.append(sub_edges)
-            
-            edges = self._assemble_block_diagonal(all_edges)
-            
-        else:
-            x_norm = F.normalize(x, p=2, dim=2)
-            similarity = torch.bmm(x_norm, x_norm.transpose(1, 2))
-            similarity = (similarity + 1) / 2
-            
-            mask_expanded = edge_prior_mask.unsqueeze(0).expand(B, -1, -1)
-            edges = similarity * mask_expanded
-        
-        # 移除自环（对角线置0）
-        num_nodes = edges.shape[1]
-        identity = torch.eye(num_nodes, device=edges.device).unsqueeze(0).expand(B, -1, -1)
+        """【简化版】动态边计算"""
+        B, P, d = x.shape
+
+        x_norm = F.normalize(x, p=2, dim=2)
+        similarity = torch.bmm(x_norm, x_norm.transpose(1, 2))
+        similarity = (similarity + 1) / 2
+
+        mask_expanded = edge_prior_mask.unsqueeze(0).expand(B, -1, -1)
+        edges = similarity * mask_expanded
+
+        # 移除自环
+        identity = torch.eye(P, device=edges.device).unsqueeze(0).expand(B, -1, -1)
         edges = edges * (1 - identity)
-        
+
         return edges
     
     def _assemble_block_diagonal(self, block_list: list) -> torch.Tensor:
@@ -228,148 +203,100 @@ class CausalNet(nn.Module):
         
         return large_edges
     
-    def prediction_whole(self, x_new, edge_prior_mask, is_large_graph=True):
-        edge = self.compute_dynamic_edges(x_new, edge_prior_mask, is_large_graph)
-        xs = self.gcn_block(x_new, edge, node_mask=None)  # 无mask
+    def prediction_whole(self, x, edge_prior_mask):
+        edge = self.compute_dynamic_edges(x, edge_prior_mask)
+        xs = self.gcn_block(x, edge, node_mask=None)
         graph = readout(xs)
         return self.mlp_causal(graph)
 
-    def prediction_intrinsic_path(self, x_new, edge_prior_mask, masks, is_large_graph=True):
+    def prediction_intrinsic_path(self, x, edge_prior_mask, masks):
         node_mask, edge_mask = masks
-        edge = self.compute_dynamic_edges(x_new, edge_prior_mask, is_large_graph)
-
-        if is_large_graph:
-            P = self.num_patches
-            x_orig = x_new[:, :P, :].clone()
-            edge_orig = edge[:, :P, :P].clone()
-            x_masked = x_orig * node_mask.unsqueeze(0).unsqueeze(-1)
-            inter_node_adj = edge_orig * edge_mask.unsqueeze(0)
-            xs = self.gcn_block(x_masked, inter_node_adj, node_mask)  # ✅
-        else:
-            x_masked = x_new * node_mask.unsqueeze(0).unsqueeze(-1)
-            inter_node_adj = edge * edge_mask.unsqueeze(0)
-            xs = self.gcn_block(x_masked, inter_node_adj, node_mask)  # ✅
-
+        edge = self.compute_dynamic_edges(x, edge_prior_mask)
+        x_masked = x * node_mask.unsqueeze(0).unsqueeze(-1)
+        inter_node_adj = edge * edge_mask.unsqueeze(0)
+        xs = self.gcn_block(x_masked, inter_node_adj, node_mask)
         graph = readout(xs)
         return self.mlp_causal(graph)
 
-    def prediction_spurious_path(self, x_new, edge_prior_mask, masks, is_large_graph=True):
+    def prediction_spurious_path(self, x, edge_prior_mask, masks):
         node_mask, edge_mask = masks
-        edge = self.compute_dynamic_edges(x_new, edge_prior_mask, is_large_graph)
+        edge = self.compute_dynamic_edges(x, edge_prior_mask)
 
         causal_mask = node_mask.unsqueeze(0).unsqueeze(-1)
-        x_perturbed = x_new * (1 - causal_mask)
+        x_perturbed = x * (1 - causal_mask)
 
         causal_edge_mask = edge_mask.unsqueeze(0)
         edge_perturbed = edge * (1 - causal_edge_mask)
 
-        # ✅ 传入反向mask (1-node_mask)
         spurious_node_mask = 1 - node_mask
         xs = self.gcn_block(x_perturbed, edge_perturbed, spurious_node_mask)
 
         graph = readout(xs)
         return self.mlp_causal(graph)
 
-    def prediction_spurious_fusion(self, x, edge_prior_mask, masks, is_large_graph=True):
-        return self._perform_fusion_replacement(
-            x, edge_prior_mask, masks,
-            fusion_type="spurious",
-            is_large_graph=is_large_graph
-        )
-
-    def prediction_intrinsic_fusion(self, x, edge_prior_mask, masks, is_large_graph=True):
-        return self._perform_fusion_replacement(
-            x, edge_prior_mask, masks,
-            fusion_type="intrinsic",
-            is_large_graph=is_large_graph
-        )
-
-    # -----------------------------------------------------------------
-    # 【全新】替换式融合 (Replacement Fusion) 逻辑
-    # -----------------------------------------------------------------
-    def _perform_fusion_replacement(
+    def _perform_fusion_batch_level(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,  # [B, P, d]
+        labels: torch.Tensor,  # [B] - 新增参数！
         edge_prior_mask: torch.Tensor,
         masks: Tuple[torch.Tensor, torch.Tensor],
-        fusion_type: str, # "intrinsic" 或 "spurious"
-        is_large_graph: bool = True
+        fusion_type: str
     ) -> torch.Tensor:
         """
-        【新】执行替换式融合的私有辅助函数
-        
-        流程:
-        1. 对大图中的所有子图（Anchor + Negatives）执行内部GCN（阶段一）。
-        2. 聚合所有负样本（Negatives）的特征，得到 "替换源" 特征。
-        3. 根据 fusion_type，有条件地用 "替换源" 替换 Anchor 的 "因果" 或 "虚假" 节点。
-        4. 对被替换后的 Anchor 图进行预测。
+        批次内对立类别融合
+
+        关键改进：只使用对立类别样本作为替换源
         """
         node_mask, edge_mask = masks
+        B, P, d = x.shape
 
-        if not is_large_graph:
-            raise ValueError("替换式融合 (Replacement Fusion) 需要大图模式")
+        # 1. 动态边 + 内部GCN
+        edges = self.compute_dynamic_edges(x, edge_prior_mask)
+        intrinsic_edge = edges * edge_mask.unsqueeze(0)
+        xs_stage1 = self.gcn_block(x, intrinsic_edge, node_mask)
 
-        B, large_P, d = x.shape
-        P = self.num_patches
+        # 2. ✅ 关键修复：为每个样本计算对立类别的聚合特征
+        replacement_features = torch.zeros_like(xs_stage1)
 
-        if large_P % P != 0:
-            raise ValueError(f"大图节点数 ({large_P}) 不是 P ({P}) 的整数倍")
-        
-        num_subgraphs = large_P // P
-        num_neg_samples = num_subgraphs - 1
-        
-        if num_neg_samples == 0:
-             raise ValueError("替换式融合需要至少一个负样本")
+        for i in range(B):
+            opposite_label = 1 - labels[i]
+            opposite_mask = (labels == opposite_label)
 
-        # ✅ 第1步：动态计算每个子图的 "因果" 边
-        full_dynamic_edges = self.compute_dynamic_edges(x, edge_prior_mask, is_large_graph=True)
-        
-        intrinsic_edge_mask_large = torch.zeros(large_P, large_P, device=x.device)
-        for i in range(num_subgraphs):
-            start = i * P
-            end = (i + 1) * P
-            intrinsic_edge_mask_large[start:end, start:end] = edge_mask
+            if opposite_mask.sum() > 0:
+                # 只取对立类别样本的平均
+                opposite_features = xs_stage1[opposite_mask]
+                replacement_features[i] = opposite_features.mean(dim=0)
+            else:
+                # 退化方案：用除自己外的所有样本
+                other_mask = torch.ones(B, dtype=torch.bool, device=x.device)
+                other_mask[i] = False
+                replacement_features[i] = xs_stage1[other_mask].mean(dim=0)
 
-        internal_edges = full_dynamic_edges * intrinsic_edge_mask_large.unsqueeze(0)
-
-        # ✅ 第2步：执行阶段一（所有子图的内部卷积）
-        # 使用 gcn_block，它只执行内部卷积
-        xs_stage1 = self.gcn_block(x, internal_edges)
-        # xs_stage1 形状 [B, (N+1)*P, d]
-
-        # ✅ 第3步：准备替换数据
-        
-        # 1. 分离 Anchor 和 Negatives
-        x_anchor_s1 = xs_stage1[:, :P, :]  # Anchor特征 [B, P, d]
-        x_negs_s1 = xs_stage1[:, P:, :]  # 所有负样本特征 [B, N*P, d]
-        
-        # 2. 重塑并聚合负样本
-        x_negs_s1_reshaped = x_negs_s1.reshape(B, num_neg_samples, P, d) # [B, N, P, d]
-        
-        # 3. 计算用于替换的"聚合信息" (取平均)
-        x_replacement_info = torch.mean(x_negs_s1_reshaped, dim=1) # [B, P, d]
-
-        # ✅ 第4步：执行“条件替换”
-        
-        # 准备掩码
-        mask_intrinsic = node_mask.reshape(1, P, 1).to(x.device) # 因果节点 [1, P, 1]
-        mask_spurious = (1 - mask_intrinsic)                     # 虚假节点 [1, P, 1]
+        # 3. 条件替换
+        mask_intrinsic = node_mask.reshape(1, P, 1)
+        mask_spurious = 1 - mask_intrinsic
 
         if fusion_type == "intrinsic":
-            # 内在融合: Anchor的因果部分被替换，虚假部分保留
-            x_anchor_new = (x_replacement_info * mask_intrinsic) + \
-                           (x_anchor_s1 * mask_spurious)
-        
+            x_fused = (replacement_features * mask_intrinsic) + (xs_stage1 * mask_spurious)
         elif fusion_type == "spurious":
-            # 虚假融合: Anchor的虚假部分被替换，因果部分保留
-            x_anchor_new = (x_anchor_s1 * mask_intrinsic) + \
-                           (x_replacement_info * mask_spurious)
+            x_fused = (xs_stage1 * mask_intrinsic) + (replacement_features * mask_spurious)
         else:
-            raise ValueError(f"未知的 fusion_type: {fusion_type}")
-        
-        # ✅ 第5步：使用被替换后的Anchor图进行预测
-        graph = readout(x_anchor_new) # x_anchor_new 是 [B, P, d]
+            raise ValueError(f"Unknown fusion_type: {fusion_type}")
+
+        # 4. 预测
+        graph = readout(x_fused)
         logits = self.mlp_causal(graph)
-        
+
         return logits
-    
+
+    # 更新对外接口（新增 labels 参数）
+    def prediction_spurious_fusion(self, x, labels, edge_prior_mask, masks):
+        return self._perform_fusion_batch_level(
+            x, labels, edge_prior_mask, masks, fusion_type="spurious"
+        )
+
+    def prediction_intrinsic_fusion(self, x, labels, edge_prior_mask, masks):
+        return self._perform_fusion_batch_level(
+            x, labels, edge_prior_mask, masks, fusion_type="intrinsic"
+        )
+

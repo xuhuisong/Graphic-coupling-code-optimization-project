@@ -135,9 +135,6 @@ class CausalMask(nn.Module):
         self, 
         lambda_reg: float = 0.01,
         lambda_edge_multiplier: float = 3.0,  # 新增参数
-        epoch: int = 0,
-        max_epochs: int = 140,
-        warmup_epochs: int = 20
     ):
         """
         简洁的稀疏性正则化：直接惩罚因果节点/边的数量
@@ -169,18 +166,9 @@ class CausalMask(nn.Module):
         else:
             edge_sparsity = torch.tensor(0.0, device=node_sparsity.device)
 
-        # 渐进式权重：从弱到强
-        if epoch < warmup_epochs:
-            # 预热期：线性增长 0 → 1.0
-            strength = epoch / warmup_epochs
-        else:
-            # 主训练：1.0 → 3.0（后期加强）
-            progress = (epoch - warmup_epochs) / (max_epochs - warmup_epochs)
-            strength = 1.0 + 2.0 * progress
-
         # 组合损失：节点 + 边
-        node_loss = lambda_reg * strength * node_sparsity
-        edge_loss = lambda_reg * strength * lambda_edge_multiplier * edge_sparsity
+        node_loss = lambda_reg * node_sparsity
+        edge_loss = lambda_reg * lambda_edge_multiplier * edge_sparsity
         total_loss = node_loss + edge_loss
 
         return total_loss

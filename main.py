@@ -95,26 +95,32 @@ def run_training_for_fold(
         batch_size=config['train']['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
+        num_workers=config['densenet']['pretrain']['num_workers'],  # 🔧 使用配置的值
+        pin_memory=True,       # ✅ 保持
+        persistent_workers=True,  # 🔧 新增：避免每epoch重启worker
+        prefetch_factor=4      # 🔧 新增：预加载4个batch
     )
-    
+
     val_loader = DataLoader(
         Subset(dataset, val_indices),
         batch_size=config['train']['test_batch_size'],
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
+        num_workers=config['densenet']['pretrain']['num_workers'],
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
-    
+
     test_loader = DataLoader(
         Subset(dataset, test_indices),
         batch_size=config['train']['test_batch_size'],
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
+        num_workers=config['densenet']['pretrain']['num_workers'],
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
     
     # 2. 创建训练器
@@ -132,7 +138,7 @@ def run_training_for_fold(
         edge_prior_mask=edge_prior_mask,
         checkpoint_manager=checkpoint_manager,
         work_dir=str(work_dir),
-        device=f"cuda:{config['misc']['device'][0]}" if config['misc']['device'] else 'cuda',
+        device='cuda',
         rank=0
     )
     

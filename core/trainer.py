@@ -1,11 +1,12 @@
 """
-Causal Graph Neural Network Trainer (简洁优雅版)
+Causal Graph Neural Network Trainer (简化优雅版 - 无大图逻辑)
 端到端训练流程：预训练 + 两阶段因果学习
 
-核心特点：
-1. 简洁的稀疏度控制 - 直接惩罚因果特征数量
-2. 渐进式增强策略 - 让模型自然找到最优平衡点
-3. 清晰的代码结构 - 易读易维护
+核心改进：
+1. 移除复杂的大图构建逻辑
+2. 使用批次内聚合作为融合替换源
+3. Stage 1 和 Stage 2 统一数据流
+4. 简洁的稀疏度控制策略
 """
 
 import os
@@ -21,27 +22,30 @@ import numpy as np
 from utils.checkpoint import CheckpointManager
 from models.causal_net import CausalNet
 from models.causal_mask import CausalMask
-from data.large_graph_builder import LargeGraphBuilder
 from utils.metrics import compute_binary_metrics
 from utils.mask_monitor import MaskMonitor
 from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
 
 class CausalTrainer:
     """
-    因果图神经网络训练器
+    因果图神经网络训练器（简化版）
     
     训练流程：
     1. 预训练阶段 (40 epochs)：整体图预测，建立基础特征表示
     2. 阶段1 (40 epochs)：学习因果掩码（内在子图 + 虚假子图）
-    3. 阶段2 (60 epochs)：因果测试与鲁棒性增强（融合图干扰）
+    3. 阶段2 (60 epochs)：因果测试与鲁棒性增强（批次内融合）
     
     核心组件：
     - DenseNet：冻结的特征提取器
     - CausalMask：可学习的因果掩码（节点 + 边）
     - CausalNet：图神经网络分类器
-    - LargeGraphBuilder：对比学习的大图构建器
+    
+    关键简化：
+    - 移除大图构建器，使用批次内均值作为融合替换源
+    - Stage 1 和 Stage 2 使用统一的数据结构 [B, P, d]
     """
     
     def __init__(
@@ -69,11 +73,12 @@ class CausalTrainer:
             param.requires_grad = False
         self.densenet_model.eval()
         
+        # 多GPU处理
         if torch.cuda.device_count() > 1:
             num_gpus = torch.cuda.device_count()
             logger.info(f"🎮 Wrapping DenseNet with DataParallel across {num_gpus} GPUs for feature extraction")
             self.densenet_model = nn.DataParallel(self.densenet_model)
-            self.feature_extract_batch_size = 64 * num_gpus  # 每GPU 64个patch
+            self.feature_extract_batch_size = 64 * num_gpus
         else:
             self.feature_extract_batch_size = 32
         
@@ -101,29 +106,17 @@ class CausalTrainer:
         self.epoch_results = {}
         self.current_mask_sums = {}
         
-        # 大图构建器（用于对比学习）
-        self.large_graph_builder = LargeGraphBuilder(
-            num_neg_samples=config['large_graph']['num_neg_samples'],
-            sampling_strategy=config['large_graph']['sampling_strategy'],
-            random_seed=config['seed']
-        )
-        
-        # 缓存全局数据（用于负样本采样）
-        self.all_data = None
-        self.all_labels = None
-        
         # 损失函数
         self.criterion = nn.CrossEntropyLoss(reduction='none')
         self.lambda_l1 = config['train']['loss_weights']['lambda_l1']
         
-        logger.info(f"✅ Trainer initialized for Fold {fold}")
-        # 添加 Mask 监控器
+        # Mask 监控器
         self.mask_monitor = MaskMonitor(
-            save_dir=str(Path(work_dir).parent),  # experiments/exp_name/
+            save_dir=str(Path(work_dir).parent),
             fold=fold
         )
         
-        logger.info(f"✅ Trainer initialized for Fold {fold}")
+        logger.info(f"✅ Trainer initialized for Fold {fold} (Simplified - No Large Graph)")
     
     # ============================================================================
     # 模型和优化器初始化
@@ -131,21 +124,19 @@ class CausalTrainer:
 
     def _build_models(self):
         """构建因果图神经网络和掩码模型"""
-        # 🔧 兼容DataParallel的feature_dim获取
         if isinstance(self.densenet_model, nn.DataParallel):
             feature_dim = self.densenet_model.module.feature_dim
         else:
             feature_dim = self.densenet_model.feature_dim
 
-        # 主GNN模型
+        # 主GNN模型（移除 num_neg_samples 参数）
         self.model = CausalNet(
             num_class=2,
             feature_dim=feature_dim,
             hidden1=self.config['model']['args']['hidden1'],
             hidden2=self.config['model']['args']['hidden2'],
             kernels=self.config['model']['args'].get('kernels', [2]),
-            num_patches=self.edge_prior_mask.shape[0],
-            num_neg_samples=self.config['large_graph']['num_neg_samples']
+            num_patches=self.edge_prior_mask.shape[0]
         ).to(self.device)
 
         # 因果掩码模型
@@ -160,11 +151,8 @@ class CausalTrainer:
             logger.info(f"🎮 Wrapping CausalNet and Mask with DataParallel across {torch.cuda.device_count()} GPUs")
             self.model = nn.DataParallel(self.model)
             self.mask = nn.DataParallel(self.mask)
-            logger.info(f"   Model device_ids: {list(range(torch.cuda.device_count()))}")
-            logger.info(f"   Expected GPU memory usage will be distributed")
 
         logger.info("✅ Models built")
- 
     
     def _setup_optimizers(self):
         """配置优化器和学习率调度器"""
@@ -180,14 +168,14 @@ class CausalTrainer:
             eta_min=1e-5
         )
 
-        # 主训练阶段：SGD + ReduceLROnPlateau
-        self.optimizer = optim.SGD(
+        # ✅ 主训练阶段：GNN用AdamW
+        self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.config['train']['base_lr'],
-            momentum=0.9,
-            nesterov=True,
-            weight_decay=self.config['train']['weight_decay']
+            weight_decay=self.config['train']['weight_decay_adamw']
         )
+
+        # ✅ Mask优化器仍用SGD
         self.optimizer_mask = optim.SGD(
             self.mask.parameters(),
             lr=self.config['train']['base_lr_mask'],
@@ -196,6 +184,7 @@ class CausalTrainer:
             weight_decay=self.config['train']['weight_decay']
         )
 
+        # 学习率调度器保持不变
         self.lr_scheduler = ReduceLROnPlateau(
             self.optimizer,
             verbose=(self.rank == 0),
@@ -209,7 +198,7 @@ class CausalTrainer:
             factor=self.config['train']['gamma']
         )
 
-        logger.info("✅ Optimizers configured")
+        logger.info("✅ Optimizers configured (GNN: AdamW, Mask: SGD)")
     
     # ============================================================================
     # 主训练入口
@@ -230,16 +219,6 @@ class CausalTrainer:
         logger.info(f"\n{'='*80}")
         logger.info(f"🚀 Training Start - Fold {self.fold}")
         logger.info(f"{'='*80}\n")
-        
-        # 预加载数据用于大图构建
-        if self.all_data is None:
-            logger.info("预加载数据用于大图构建...")
-            dataset = train_loader.dataset
-            if hasattr(dataset, 'dataset'):
-                dataset = dataset.dataset
-            self.all_data = np.array(dataset.all_patches)
-            self.all_labels = np.array(dataset.labels)
-            logger.info(f"✅ 数据预加载完成: {self.all_data.shape}")        
         
         # 初始化模型和优化器
         self._build_models()
@@ -458,7 +437,13 @@ class CausalTrainer:
                 self.best_epoch = -1
     
     def _train_main_epoch(self, epoch: int, train_loader: DataLoader, is_stage1: bool):
-        """主训练的单个epoch（Mask和GNN交替训练）"""
+        """
+        主训练的单个epoch（Mask和GNN交替训练）
+        
+        关键简化：
+        - Stage 1 和 Stage 2 使用统一的数据流 [B, P, d]
+        - 移除大图构建逻辑
+        """
         self.model.train()
         self.mask.train()
 
@@ -477,22 +462,9 @@ class CausalTrainer:
             self.global_step += 1
             label = label.to(self.device)
 
-            # 根据阶段构建数据和特征
-            if is_stage1:
-                # 阶段1：仅使用原始图
-                data = data.to(self.device)
-                x_features = self._extract_features(data)
-            else:
-                # 阶段2：构建大图（Anchor + Negatives）
-                large_data, large_edge = self.large_graph_builder.build_large_graph(
-                    batch_data=data,
-                    batch_labels=label,
-                    base_edge=self.edge_prior_mask.cpu(),
-                    all_data=self.all_data,
-                    all_labels=self.all_labels
-                )
-                large_data = large_data.to(self.device)
-                x_features = self._extract_features(large_data)
+            # ✅ 统一处理：无论Stage 1还是Stage 2，都使用原始图
+            data = data.to(self.device)
+            x_features = self._extract_features(data)
 
             # ========== 步骤1: 训练Mask（固定GNN） ==========
             for param in self.model.parameters():
@@ -503,11 +475,11 @@ class CausalTrainer:
 
             if is_stage1:
                 result_mask = self._compute_stage1_mask_loss(
-                    x_features, masks, label, epoch, self.edge_prior_mask, is_large_graph=False
+                    x_features, masks, label, epoch, self.edge_prior_mask
                 )
             else:
                 result_mask = self._compute_stage2_mask_loss(
-                    x_features, masks, label, epoch, self.edge_prior_mask, is_large_graph=True
+                    x_features, masks, label, epoch, self.edge_prior_mask
                 )
 
             self.optimizer_mask.zero_grad()
@@ -537,11 +509,11 @@ class CausalTrainer:
 
             if is_stage1:
                 result_gnn = self._compute_stage1_gnn_loss(
-                    x_features, masks, label, self.edge_prior_mask, is_large_graph=False
+                    x_features, masks, label, self.edge_prior_mask
                 )
             else:
                 result_gnn = self._compute_stage2_gnn_loss(
-                    x_features, masks, label, self.edge_prior_mask, is_large_graph=True
+                    x_features, masks, label, self.edge_prior_mask
                 )
 
             self.optimizer.zero_grad()
@@ -602,7 +574,7 @@ class CausalTrainer:
 
             model_module = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
             outputs = model_module.prediction_intrinsic_path(
-                x_features, self.edge_prior_mask, masks, is_large_graph=False
+                x_features, self.edge_prior_mask, masks
             )
 
             all_outputs.append(outputs)
@@ -613,8 +585,8 @@ class CausalTrainer:
         metrics = compute_binary_metrics(all_outputs, all_labels)
         self.epoch_results[epoch][phase] = metrics
 
-        # ========== 新增：保存 Mask Logits ==========
-        if self.rank == 0 and phase == 'val':  # 只在验证集评估后保存
+        # 保存 Mask Logits
+        if self.rank == 0 and phase == 'val':
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
 
             # 准备额外信息
@@ -677,10 +649,10 @@ class CausalTrainer:
                 )
     
     # ============================================================================
-    # 损失计算函数
+    # 损失计算函数（移除所有 is_large_graph 参数）
     # ============================================================================
     
-    def _compute_stage1_mask_loss(self, x, masks, label, epoch, edge_prior_mask, is_large_graph):
+    def _compute_stage1_mask_loss(self, x, masks, label, epoch, edge_prior_mask):
         """
         阶段1 Mask损失：内在子图 + 虚假子图
         
@@ -692,21 +664,18 @@ class CausalTrainer:
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 内在子图预测
-        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
         loss_pred = self.criterion(y_pred, label).mean()
         
         # 虚假子图（熵损失）
-        y_spu = model.prediction_spurious_path(x, edge_prior_mask, masks, is_large_graph)
+        y_spu = model.prediction_spurious_path(x, edge_prior_mask, masks)
         loss_spu = self._entropy_loss(y_spu)
         
         # 稀疏性正则（简洁版）
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
         reg_loss = mask_module.compute_sparsity_regularization(
             lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
-            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0),  # 新增
-            epoch=epoch - self.config['train']['pre_epoch'],
-            max_epochs=self.config['train']['num_epoch'] - self.config['train']['pre_epoch'],
-            warmup_epochs=self.config['train']['sparsity_warmup_epochs']
+            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0)
         )
         
         # 组合损失
@@ -726,9 +695,9 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage2_mask_loss(self, x, masks, label, epoch, edge_prior_mask, is_large_graph):
+    def _compute_stage2_mask_loss(self, x, masks, label, epoch, edge_prior_mask):
         """
-        阶段2 Mask损失：融合图干扰测试
+        阶段2 Mask损失：批次内融合测试
         
         目标：
         - 内在子图：准确预测标签
@@ -738,25 +707,22 @@ class CausalTrainer:
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
         # 内在子图
-        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
         loss_pred = self.criterion(y_pred, label).mean()
         
-        # 虚假融合（测试不变性）
-        y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks, is_large_graph)
+        # 虚假融合（测试不变性）- 使用批次内聚合
+        y_inv = model.prediction_spurious_fusion(x, label, edge_prior_mask, masks)
         loss_inv = self.criterion(y_inv, label).mean()
         
-        # 内在融合（测试敏感性）
-        y_sen = model.prediction_intrinsic_fusion(x, edge_prior_mask, masks, is_large_graph)
+        # 内在融合（测试敏感性）- 使用批次内聚合
+        y_sen = model.prediction_intrinsic_fusion(x, label, edge_prior_mask, masks)
         loss_sen = self.criterion(y_sen, 1 - label).mean()
         
         # 稀疏性正则
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
         reg_loss = mask_module.compute_sparsity_regularization(
             lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
-            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0),  # 新增
-            epoch=epoch - self.config['train']['pre_epoch'],
-            max_epochs=self.config['train']['num_epoch'] - self.config['train']['pre_epoch'],
-            warmup_epochs=self.config['train']['sparsity_warmup_epochs']
+            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0)
         )
         
         # 组合损失
@@ -783,13 +749,14 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage1_gnn_loss(self, x, masks, label, edge_prior_mask, is_large_graph):
+    def _compute_stage1_gnn_loss(self, x, masks, label, edge_prior_mask):
         """阶段1 GNN损失：内在子图预测"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
         loss_pred = self.criterion(y_pred, label).mean()
-        l1_loss = self._compute_l1_regularization()
+        #l1_loss = self._compute_l1_regularization()
+        l1_loss = 0
         loss_all = loss_pred + l1_loss
         
         return {
@@ -803,17 +770,18 @@ class CausalTrainer:
             }
         }
     
-    def _compute_stage2_gnn_loss(self, x, masks, label, edge_prior_mask, is_large_graph):
+    def _compute_stage2_gnn_loss(self, x, masks, label, edge_prior_mask):
         """阶段2 GNN损失：内在子图 + 虚假融合"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         
-        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks, is_large_graph)
+        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
         loss_pred = self.criterion(y_pred, label).mean()
         
-        y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks, is_large_graph) 
+        y_inv = model.prediction_spurious_fusion(x, label, edge_prior_mask, masks)
         loss_inv = self.criterion(y_inv, label).mean()
         
-        l1_loss = self._compute_l1_regularization()
+        #l1_loss = self._compute_l1_regularization()
+        l1_loss = 0
         loss_all = loss_pred + loss_inv + l1_loss
         
         return {
@@ -850,24 +818,15 @@ class CausalTrainer:
         data_reshaped = data.view(-1, 1, data.shape[3], data.shape[4], data.shape[5])
         total_patches = data_reshaped.shape[0]
 
-        # 🔧 优化：根据GPU数量动态调整批处理大小
         batch_size = getattr(self, 'feature_extract_batch_size', 32)
 
         all_features = []
         with torch.no_grad():
             for i in range(0, total_patches, batch_size):
                 batch = data_reshaped[i:i+batch_size]
-
-                # DataParallel会自动分配到各GPU
                 features_batch = self.densenet_model(batch)
-
-                # ✅ 关键优化：保持在GPU上，延迟CPU传输
                 all_features.append(features_batch)
 
-                # ❌ 移除频繁的empty_cache（会阻塞GPU）
-                # torch.cuda.empty_cache()  # 删除这行
-
-        # ✅ 在GPU上拼接（避免多次CPU-GPU传输）
         features = torch.cat(all_features, dim=0)
         features = features.view(B, total_P, -1)
 
@@ -1036,17 +995,14 @@ class CausalTrainer:
             'test_acc': self.best_test_acc
         }
 
-        # ========== 新增：生成 Mask 分析报告 ==========
+        # 生成 Mask 分析报告
         if self.rank == 0:
             logger.info("\n" + "-"*80)
             logger.info("📊 Generating Mask Analysis Reports...")
             logger.info("-"*80)
 
             try:
-                # 保存摘要
                 self.mask_monitor.save_summary()
-
-                # 生成分析报告
                 self.mask_monitor.generate_analysis_report()
 
                 logger.info("✅ Mask analysis completed")
