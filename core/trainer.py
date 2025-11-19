@@ -703,6 +703,7 @@ class CausalTrainer:
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
         reg_loss = mask_module.compute_sparsity_regularization(
             lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
+            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0),  # 新增
             epoch=epoch - self.config['train']['pre_epoch'],
             max_epochs=self.config['train']['num_epoch'] - self.config['train']['pre_epoch'],
             warmup_epochs=self.config['train']['sparsity_warmup_epochs']
@@ -752,6 +753,7 @@ class CausalTrainer:
         mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
         reg_loss = mask_module.compute_sparsity_regularization(
             lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
+            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0),  # 新增
             epoch=epoch - self.config['train']['pre_epoch'],
             max_epochs=self.config['train']['num_epoch'] - self.config['train']['pre_epoch'],
             warmup_epochs=self.config['train']['sparsity_warmup_epochs']

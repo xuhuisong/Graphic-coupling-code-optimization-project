@@ -134,6 +134,7 @@ class CausalMask(nn.Module):
     def compute_sparsity_regularization(
         self, 
         lambda_reg: float = 0.01,
+        lambda_edge_multiplier: float = 3.0,  # 新增参数
         epoch: int = 0,
         max_epochs: int = 140,
         warmup_epochs: int = 20
@@ -178,7 +179,9 @@ class CausalMask(nn.Module):
             strength = 1.0 + 2.0 * progress
 
         # 组合损失：节点 + 边
-        total_loss = lambda_reg * strength * (node_sparsity + edge_sparsity)
+        node_loss = lambda_reg * strength * node_sparsity
+        edge_loss = lambda_reg * strength * lambda_edge_multiplier * edge_sparsity
+        total_loss = node_loss + edge_loss
 
         return total_loss
     

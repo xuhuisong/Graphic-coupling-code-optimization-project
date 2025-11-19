@@ -64,26 +64,25 @@ train:
   
   # 优化器
   optimizer: SGD
-  base_lr: 0.0001
+  base_lr: 0.0003
   base_lr_mask: 4
   weight_decay: 0.0005
   nesterov: true
   scheduler: auto
-  stepsize: 20
+  stepsize: 30
   gamma: 0.7
   
   # 稀疏度正则化预热（新增）
-  sparsity_warmup_epochs: 10
-  
-  # 损失权重
   loss_weights:
-    L_inv: 1
-    L_sen: 1
+    L_inv: 0.5
+    L_sen: 0.5
     L_pred: 1
     L_spu: 1
-    LG: 0.002
     lambda_l1: 0.0001
-    lambda_sparsity: 0.2  
+    lambda_sparsity: 0.2
+    lambda_edge_multiplier: 3.0  # 新增这一行
+
+  sparsity_warmup_epochs: 15
 
 # 模型配置
 model:
