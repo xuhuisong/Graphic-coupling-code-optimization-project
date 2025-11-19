@@ -47,18 +47,12 @@ graph:
     dist_type: euc_1+gau
     adj_norm: DAD
 
-# 大图配置（对比学习）
-large_graph:
-  enabled: true
-  num_neg_samples: 2
-  sampling_strategy: opposite_label
-
 # 主训练配置
 train:
   folds: [0, 1, 2, 3, 4]
-  pre_epoch: 60
-  num_epoch: 140
-  stage_transition_epoch: 100
+  pre_epoch: 30
+  num_epoch: 110
+  stage_transition_epoch: 70
   batch_size: 72          # 🔧 增加批次大小 (每GPU 24个)
   test_batch_size: 66
   
@@ -66,6 +60,7 @@ train:
   optimizer: SGD
   base_lr: 0.0003
   base_lr_mask: 4
+  weight_decay_adamw: 0.01
   weight_decay: 0.0005
   nesterov: true
   scheduler: auto
@@ -74,13 +69,13 @@ train:
   
   # 稀疏度正则化预热（新增）
   loss_weights:
-    L_inv: 0.5
+    L_inv: 0
     L_sen: 0.5
     L_pred: 1
     L_spu: 1
-    lambda_l1: 0.0001
+    lambda_l1: 0
     lambda_sparsity: 0.2
-    lambda_edge_multiplier: 3.0  # 新增这一行
+    lambda_edge_multiplier: 6.0  # 新增这一行
 
   sparsity_warmup_epochs: 15
 
