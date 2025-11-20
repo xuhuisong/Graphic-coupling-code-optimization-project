@@ -437,124 +437,135 @@ class CausalTrainer:
                 self.best_epoch = -1
     
     def _train_main_epoch(self, epoch: int, train_loader: DataLoader, is_stage1: bool):
-        """
-        主训练的单个epoch（Mask和GNN交替训练）
-        
-        关键简化：
-        - Stage 1 和 Stage 2 使用统一的数据流 [B, P, d]
-        - 移除大图构建逻辑
-        """
-        self.model.train()
-        self.mask.train()
+            """
+            主训练的单个epoch（Mask和GNN交替训练）
 
-        # 损失和准确率累积器
-        losses_mask = {
-            'all': [], 'Intrinsic': [], 'Spurious': [], 'spurious_fusion': [],
-            'intrinsic_fusion': [], 'sparsity_reg': []
-        }
-        losses_gnn = {
-            'all': [], 'Intrinsic': [], 'spurious_fusion': [], 'l1_reg': []
-        }
-        accs_mask = {}
-        accs_gnn = {}
+            优化点：
+            - 注册 prototype_div 指标
+            - 统一数据流，移除大图逻辑
+            - 修正调用参数顺序
+            """
+            self.model.train()
+            self.mask.train()
 
-        for batch_idx, (data, _, label) in enumerate(train_loader):
-            self.global_step += 1
-            label = label.to(self.device)
+            # 损失和准确率累积器
+            # 【修改】这里加入了 'prototype_div' 以便记录日志
+            losses_mask = {
+                'all': [], 
+                'Intrinsic': [], 
+                'Spurious': [], 
+                'spurious_fusion': [],
+                'intrinsic_fusion': [], 
+                'sparsity_reg': [],
+                'prototype_div': []   # <--- 新增指标注册
+            }
 
-            # ✅ 统一处理：无论Stage 1还是Stage 2，都使用原始图
-            data = data.to(self.device)
-            x_features = self._extract_features(data)
+            losses_gnn = {
+                'all': [], 'Intrinsic': [], 'spurious_fusion': [], 'l1_reg': []
+            }
+            accs_mask = {}
+            accs_gnn = {}
 
-            # ========== 步骤1: 训练Mask（固定GNN） ==========
-            for param in self.model.parameters():
-                param.requires_grad = False
+            for batch_idx, (data, _, label) in enumerate(train_loader):
+                self.global_step += 1
+                label = label.to(self.device)
 
-            mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            masks, sparsity = mask_module(train=True)
+                # ✅ 统一处理：无论Stage 1还是Stage 2，都直接使用原始数据提取特征
+                # (不再需要 build_large_graph)
+                data = data.to(self.device)
+                x_features = self._extract_features(data)
 
-            if is_stage1:
-                result_mask = self._compute_stage1_mask_loss(
-                    x_features, masks, label, epoch, self.edge_prior_mask
-                )
-            else:
-                result_mask = self._compute_stage2_mask_loss(
-                    x_features, masks, label, epoch, self.edge_prior_mask
-                )
+                # ========== 步骤1: 训练Mask（固定GNN） ==========
+                for param in self.model.parameters():
+                    param.requires_grad = False
 
-            self.optimizer_mask.zero_grad()
-            if 'all' in result_mask['loss'] and isinstance(result_mask['loss']['all'], torch.Tensor):
-                result_mask['loss']['all'].backward()
-            self.optimizer_mask.step()
+                mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
+                masks, sparsity = mask_module(train=True)
 
-            # 记录Mask损失
-            for k in losses_mask.keys():
-                val = result_mask['loss'].get(k, 0)
-                if isinstance(val, torch.Tensor):
-                    losses_mask[k].append(val.item())
+                if is_stage1:
+                    result_mask = self._compute_stage1_mask_loss(
+                        x_features, masks, label, epoch, self.edge_prior_mask
+                    )
                 else:
-                    losses_mask[k].append(float(val))
-            
-            for k, v in result_mask['preds'].items():
-                if k not in accs_mask:
-                    accs_mask[k] = []
-                accs_mask[k].append(self._compute_accuracy(v, label))
+                    # Stage 2: 使用动态 Ratio + 原型分离
+                    result_mask = self._compute_stage2_mask_loss(
+                        x_features, masks, label, epoch, self.edge_prior_mask
+                    )
 
-            # ========== 步骤2: 训练GNN（固定Mask） ==========
-            for param in self.model.parameters():
-                param.requires_grad = True
+                self.optimizer_mask.zero_grad()
+                if 'all' in result_mask['loss'] and isinstance(result_mask['loss']['all'], torch.Tensor):
+                    result_mask['loss']['all'].backward()
+                self.optimizer_mask.step()
 
-            masks, sparsity = mask_module(train=False)
-            masks = [m.detach() for m in masks]
+                # 记录Mask损失
+                for k in losses_mask.keys():
+                    # 使用 .get(k, 0) 防止某个阶段没有该 loss 报错
+                    val = result_mask['loss'].get(k, 0)
+                    if isinstance(val, torch.Tensor):
+                        losses_mask[k].append(val.item())
+                    else:
+                        losses_mask[k].append(float(val))
 
-            if is_stage1:
-                result_gnn = self._compute_stage1_gnn_loss(
-                    x_features, masks, label, self.edge_prior_mask
-                )
-            else:
-                result_gnn = self._compute_stage2_gnn_loss(
-                    x_features, masks, label, self.edge_prior_mask
-                )
+                for k, v in result_mask['preds'].items():
+                    if k not in accs_mask:
+                        accs_mask[k] = []
+                    accs_mask[k].append(self._compute_accuracy(v, label))
 
-            self.optimizer.zero_grad()
-            if 'all' in result_gnn['loss'] and isinstance(result_gnn['loss']['all'], torch.Tensor):
-                result_gnn['loss']['all'].backward()
-            self.optimizer.step()
+                # ========== 步骤2: 训练GNN（固定Mask） ==========
+                for param in self.model.parameters():
+                    param.requires_grad = True
 
-            # 记录GNN损失
-            for k in losses_gnn.keys():
-                val = result_gnn['loss'].get(k, 0)
-                if isinstance(val, torch.Tensor):
-                    losses_gnn[k].append(val.item())
+                masks, sparsity = mask_module(train=False)
+                masks = [m.detach() for m in masks]
+
+                if is_stage1:
+                    result_gnn = self._compute_stage1_gnn_loss(
+                        x_features, masks, label, self.edge_prior_mask
+                    )
                 else:
-                    losses_gnn[k].append(float(val))
-            
-            for k, v in result_gnn['preds'].items():
-                if k not in accs_gnn:
-                    accs_gnn[k] = []
-                accs_gnn[k].append(self._compute_accuracy(v, label))
+                    result_gnn = self._compute_stage2_gnn_loss(
+                        x_features, masks, label, self.edge_prior_mask
+                    )
 
-            # 更新当前掩码统计
+                self.optimizer.zero_grad()
+                if 'all' in result_gnn['loss'] and isinstance(result_gnn['loss']['all'], torch.Tensor):
+                    result_gnn['loss']['all'].backward()
+                self.optimizer.step()
+
+                # 记录GNN损失
+                for k in losses_gnn.keys():
+                    val = result_gnn['loss'].get(k, 0)
+                    if isinstance(val, torch.Tensor):
+                        losses_gnn[k].append(val.item())
+                    else:
+                        losses_gnn[k].append(float(val))
+
+                for k, v in result_gnn['preds'].items():
+                    if k not in accs_gnn:
+                        accs_gnn[k] = []
+                    accs_gnn[k].append(self._compute_accuracy(v, label))
+
+                # 更新当前掩码统计
+                if self.rank == 0:
+                    self.current_mask_sums = {
+                        'node': masks[0].sum().item(),
+                        'edge': masks[1].sum().item()
+                    }
+
+            # Epoch结束，保存结果
             if self.rank == 0:
-                self.current_mask_sums = {
-                    'node': masks[0].sum().item(),
-                    'edge': masks[1].sum().item()
-                }
+                train_res = {'mask': {}, 'gnn': {}}
 
-        # Epoch结束，保存结果
-        if self.rank == 0:
-            train_res = {'mask': {}, 'gnn': {}}
+                for k in losses_mask.keys():
+                    train_res['mask'][k] = float(np.mean(losses_mask[k])) if len(losses_mask[k]) > 0 else 0.0
+                for k in losses_gnn.keys():
+                    train_res['gnn'][k] = float(np.mean(losses_gnn[k])) if len(losses_gnn[k]) > 0 else 0.0
+                for k, v in accs_mask.items():
+                    train_res['mask'][f'acc_{k}'] = float(np.mean(v)) if len(v) > 0 else 0.0
+                for k, v in accs_gnn.items():
+                    train_res['gnn'][f'acc_{k}'] = float(np.mean(v)) if len(v) > 0 else 0.0
 
-            for k in losses_mask.keys():
-                train_res['mask'][k] = float(np.mean(losses_mask[k])) if len(losses_mask[k]) > 0 else 0.0
-            for k in losses_gnn.keys():
-                train_res['gnn'][k] = float(np.mean(losses_gnn[k])) if len(losses_gnn[k]) > 0 else 0.0
-            for k, v in accs_mask.items():
-                train_res['mask'][f'acc_{k}'] = float(np.mean(v)) if len(v) > 0 else 0.0
-            for k, v in accs_gnn.items():
-                train_res['gnn'][f'acc_{k}'] = float(np.mean(v)) if len(v) > 0 else 0.0
-
-            self.epoch_results[epoch]['train'] = train_res
+                self.epoch_results[epoch]['train'] = train_res
     
     def _eval_main_epoch(self, epoch: int, data_loader: DataLoader, phase: str):
         """主训练阶段的评估"""
@@ -696,59 +707,71 @@ class CausalTrainer:
         }
     
     def _compute_stage2_mask_loss(self, x, masks, label, epoch, edge_prior_mask):
-        """
-        阶段2 Mask损失：批次内融合测试
-        
-        目标：
-        - 内在子图：准确预测标签
-        - 虚假融合：测试不变性（替换虚假节点后仍能预测正确）
-        - 内在融合：测试敏感性（替换因果节点后预测翻转）
-        """
-        model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-        
-        # 内在子图
-        y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
-        loss_pred = self.criterion(y_pred, label).mean()
-        
-        # 虚假融合（测试不变性）- 使用批次内聚合
-        y_inv = model.prediction_spurious_fusion(x, label, edge_prior_mask, masks)
-        loss_inv = self.criterion(y_inv, label).mean()
-        
-        # 内在融合（测试敏感性）- 使用批次内聚合
-        y_sen = model.prediction_intrinsic_fusion(x, label, edge_prior_mask, masks)
-        loss_sen = self.criterion(y_sen, 1 - label).mean()
-        
-        # 稀疏性正则
-        mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-        reg_loss = mask_module.compute_sparsity_regularization(
-            lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
-            lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0)
-        )
-        
-        # 组合损失
-        loss_weights = self.config['train']['loss_weights']
-        loss_all = (
-            loss_weights['L_inv'] * loss_inv + 
-            loss_weights['L_sen'] * loss_sen + 
-            loss_weights['L_pred'] * loss_pred + 
-            reg_loss
-        )
-        
-        return {
-            'loss': {
-                'all': loss_all,
-                'spurious_fusion': loss_inv,
-                'intrinsic_fusion': loss_sen,
-                'Intrinsic': loss_pred,
-                'sparsity_reg': reg_loss
-            },
-            'preds': {
-                'spurious_fusion': y_inv,
-                'intrinsic_fusion': y_sen,
-                'Intrinsic': y_pred
+            """阶段2 Mask损失 (Final Version)"""
+            model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+            # 1. 基础预测
+            y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
+            loss_pred = self.criterion(y_pred, label).mean()
+
+            # 2. 虚假融合 (测试不变性) - 记得传入 labels
+            y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks,labels=label)
+            loss_inv = self.criterion(y_inv, label).mean()
+
+            # 3. 【核心修改】动态计算 Mining Ratio (课程学习)
+            # -------------------------------------------------
+            start_ratio = 0.4   # 初期：覆盖 80% (广撒网)
+            end_ratio = 0.1     # 后期：只打 10% (精细化)
+
+            current_stage_epoch = epoch - self.config['train']['pre_epoch']
+            max_stage_epochs = self.config['train']['num_epoch'] - self.config['train']['pre_epoch']
+            # 防止除以0
+            if max_stage_epochs > 0:
+                progress = max(0, min(1, current_stage_epoch / max_stage_epochs))
+            else:
+                progress = 1.0
+
+            current_ratio = start_ratio - (start_ratio - end_ratio) * progress
+            # -------------------------------------------------
+
+            # 4. 【新增】原型分离损失 (替代原本的 loss_sen)
+            loss_proto = model.compute_prototype_divergence(
+                x, masks, label, 
+                mining_ratio=current_ratio
+            )
+
+            # 5. 稀疏性正则 (权重建议在 config 中降低)
+            mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
+            reg_loss = mask_module.compute_sparsity_regularization(
+                lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
+                lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0)
+            )
+
+            # 6. 组合损失
+            loss_weights = self.config['train']['loss_weights']
+            lambda_proto = loss_weights.get('lambda_proto', 1.0) # 默认 1.0
+
+            loss_all = (
+                loss_weights['L_inv'] * loss_inv + 
+                loss_weights['L_pred'] * loss_pred + 
+                lambda_proto * loss_proto +   # 新的主力约束
+                reg_loss
+            )
+
+            return {
+                'loss': {
+                    'all': loss_all,
+                    'spurious_fusion': loss_inv,
+                    'prototype_div': loss_proto,
+                    'Intrinsic': loss_pred,
+                    'sparsity_reg': reg_loss
+                },
+                'preds': {
+                    'spurious_fusion': y_inv,
+                    'Intrinsic': y_pred
+                }
             }
-        }
-    
+
     def _compute_stage1_gnn_loss(self, x, masks, label, edge_prior_mask):
         """阶段1 GNN损失：内在子图预测"""
         model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
@@ -777,7 +800,7 @@ class CausalTrainer:
         y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
         loss_pred = self.criterion(y_pred, label).mean()
         
-        y_inv = model.prediction_spurious_fusion(x, label, edge_prior_mask, masks)
+        y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks, labels=label)
         loss_inv = self.criterion(y_inv, label).mean()
         
         #l1_loss = self._compute_l1_regularization()
@@ -891,90 +914,93 @@ class CausalTrainer:
         logger.info("="*80 + "\n")
     
     def _print_main_summary(self, epoch: int, is_stage1: bool):
-        """打印主训练阶段的训练总结"""
-        res = self.epoch_results[epoch]
-        train_res = res.get('train', {})
-        val_res = res.get('val', {})
-        test_res = res.get('test', {})
+            """打印主训练阶段的训练总结"""
+            res = self.epoch_results[epoch]
+            train_res = res.get('train', {})
+            val_res = res.get('val', {})
+            test_res = res.get('test', {})
 
-        mask_res = train_res.get('mask', {})
-        gnn_res = train_res.get('gnn', {})
+            mask_res = train_res.get('mask', {})
+            gnn_res = train_res.get('gnn', {})
 
-        stage_name = "Stage 1 (Causal Separation)" if is_stage1 else "Stage 2 (Robustness Enhancement)"
+            stage_name = "Stage 1 (Causal Separation)" if is_stage1 else "Stage 2 (Robustness Enhancement)"
 
-        logger.info("="*80)
-        logger.info(f"🎯 Epoch {epoch+1}/{self.config['train']['num_epoch']} [{stage_name}]")
-        logger.info("-"*80)
+            logger.info("="*80)
+            logger.info(f"🎯 Epoch {epoch+1}/{self.config['train']['num_epoch']} [{stage_name}]")
+            logger.info("-"*80)
 
-        # 官方评估指标
-        logger.info(f"📊 Validation Metrics:")
-        logger.info(f"   Acc: {val_res.get('accuracy', 0):.4f}, "
-                   f"AUC: {val_res.get('auc', 0):.4f}, "
-                   f"F1: {val_res.get('f1', 0):.4f}")
-        logger.info(f"   Sens: {val_res.get('sensitivity', 0):.4f}, "
-                   f"Spec: {val_res.get('specificity', 0):.4f}, "
-                   f"Prec: {val_res.get('precision', 0):.4f}")
+            # 官方评估指标
+            logger.info(f"📊 Validation Metrics:")
+            logger.info(f"   Acc: {val_res.get('accuracy', 0):.4f}, "
+                       f"AUC: {val_res.get('auc', 0):.4f}, "
+                       f"F1: {val_res.get('f1', 0):.4f}")
+            logger.info(f"   Sens: {val_res.get('sensitivity', 0):.4f}, "
+                       f"Spec: {val_res.get('specificity', 0):.4f}, "
+                       f"Prec: {val_res.get('precision', 0):.4f}")
 
-        logger.info(f"\n📊 Test Metrics:")
-        logger.info(f"   Acc: {test_res.get('accuracy', 0):.4f}, "
-                   f"AUC: {test_res.get('auc', 0):.4f}, "
-                   f"F1: {test_res.get('f1', 0):.4f}")
-        logger.info(f"   Sens: {test_res.get('sensitivity', 0):.4f}, "
-                   f"Spec: {test_res.get('specificity', 0):.4f}, "
-                   f"Prec: {test_res.get('precision', 0):.4f}")
+            logger.info(f"\n📊 Test Metrics:")
+            logger.info(f"   Acc: {test_res.get('accuracy', 0):.4f}, "
+                       f"AUC: {test_res.get('auc', 0):.4f}, "
+                       f"F1: {test_res.get('f1', 0):.4f}")
+            logger.info(f"   Sens: {test_res.get('sensitivity', 0):.4f}, "
+                       f"Spec: {test_res.get('specificity', 0):.4f}, "
+                       f"Prec: {test_res.get('precision', 0):.4f}")
 
-        # Mask训练详情
-        logger.info(f"\n🎭 Mask Training:")
-        logger.info(f"   Total Loss: {mask_res.get('all', 0):.4f}")
-        if is_stage1:
-            logger.info(f"     ├─ Intrinsic:  {mask_res.get('Intrinsic', 0):.4f} "
-                       f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
-            logger.info(f"     ├─ Spurious:   {mask_res.get('Spurious', 0):.4f} "
-                       f"(Acc: {mask_res.get('acc_Spurious', 0):.2%})")
-            logger.info(f"     └─ Sparsity:   {mask_res.get('sparsity_reg', 0):.4f}")
-        else:
-            logger.info(f"     ├─ Intrinsic:        {mask_res.get('Intrinsic', 0):.4f} "
-                       f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
-            logger.info(f"     ├─ Spurious Fusion:  {mask_res.get('spurious_fusion', 0):.4f} "
-                       f"(Acc: {mask_res.get('acc_spurious_fusion', 0):.2%})")
-            logger.info(f"     ├─ Intrinsic Fusion: {mask_res.get('intrinsic_fusion', 0):.4f} "
-                       f"(Acc: {mask_res.get('acc_intrinsic_fusion', 0):.2%})")
-            logger.info(f"     └─ Sparsity:         {mask_res.get('sparsity_reg', 0):.4f}")
+            # Mask训练详情
+            logger.info(f"\n🎭 Mask Training:")
+            logger.info(f"   Total Loss: {mask_res.get('all', 0):.4f}")
+            if is_stage1:
+                logger.info(f"     ├─ Intrinsic:  {mask_res.get('Intrinsic', 0):.4f} "
+                           f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
+                logger.info(f"     ├─ Spurious:   {mask_res.get('Spurious', 0):.4f} "
+                           f"(Acc: {mask_res.get('acc_Spurious', 0):.2%})")
+                logger.info(f"     └─ Sparsity:   {mask_res.get('sparsity_reg', 0):.4f}")
+            else:
+                logger.info(f"     ├─ Intrinsic:       {mask_res.get('Intrinsic', 0):.4f} "
+                           f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
+                logger.info(f"     ├─ Spurious Fusion: {mask_res.get('spurious_fusion', 0):.4f} "
+                           f"(Acc: {mask_res.get('acc_spurious_fusion', 0):.2%})")
 
-        # GNN训练详情
-        logger.info(f"\n🧠 GNN Training:")
-        logger.info(f"   Total Loss: {gnn_res.get('all', 0):.4f}")
-        logger.info(f"     ├─ Intrinsic: {gnn_res.get('Intrinsic', 0):.4f} "
-                   f"(Acc: {gnn_res.get('acc_Intrinsic', 0):.2%})")
-        if not is_stage1:
-            logger.info(f"     ├─ Spurious Fusion: {gnn_res.get('spurious_fusion', 0):.4f} "
-                       f"(Acc: {gnn_res.get('acc_spurious_fusion', 0):.2%})")
-        logger.info(f"     └─ L1 Reg:     {gnn_res.get('l1_reg', 0):.4f}")
+                # 【修改】新增 Prototype Div 日志打印
+                logger.info(f"     ├─ Prototype Div:   {mask_res.get('prototype_div', 0):.4f}")
 
-        # 学习率
-        lr_gnn = self.optimizer.param_groups[0]['lr']
-        lr_mask = self.optimizer_mask.param_groups[0]['lr']
-        logger.info(f"\n⚙️  Learning Rates:")
-        logger.info(f"   GNN:  {lr_gnn:.6f}")
-        logger.info(f"   Mask: {lr_mask:.6f}")
+                logger.info(f"     └─ Sparsity:        {mask_res.get('sparsity_reg', 0):.4f}")
 
-        # 掩码稀疏度统计
-        if self.current_mask_sums:
-            mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
-            total_nodes = mask_module.P
-            total_edges = int(mask_module.learnable_mask.sum().item())
+            # GNN训练详情
+            logger.info(f"\n🧠 GNN Training:")
+            logger.info(f"   Total Loss: {gnn_res.get('all', 0):.4f}")
+            logger.info(f"     ├─ Intrinsic: {gnn_res.get('Intrinsic', 0):.4f} "
+                       f"(Acc: {gnn_res.get('acc_Intrinsic', 0):.2%})")
+            if not is_stage1:
+                logger.info(f"     ├─ Spurious Fusion: {gnn_res.get('spurious_fusion', 0):.4f} "
+                           f"(Acc: {gnn_res.get('acc_spurious_fusion', 0):.2%})")
+            logger.info(f"     └─ L1 Reg:     {gnn_res.get('l1_reg', 0):.4f}")
 
-            node_sum = int(self.current_mask_sums.get('node', 0))
-            edge_sum = int(self.current_mask_sums.get('edge', 0))
+            # 学习率
+            lr_gnn = self.optimizer.param_groups[0]['lr']
+            lr_mask = self.optimizer_mask.param_groups[0]['lr']
+            logger.info(f"\n⚙️  Learning Rates:")
+            logger.info(f"   GNN:  {lr_gnn:.6f}")
+            logger.info(f"   Mask: {lr_mask:.6f}")
 
-            node_pct = node_sum / total_nodes * 100 if total_nodes > 0 else 0
-            edge_pct = edge_sum / total_edges * 100 if total_edges > 0 else 0
+            # 掩码稀疏度统计
+            if self.current_mask_sums:
+                mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
+                total_nodes = mask_module.P
+                # 注意：如果使用了僵尸边处理策略，这里的分母计算可能需要微调，但作为日志展示通常足够
+                total_edges = int(mask_module.learnable_mask.sum().item())
 
-            logger.info(f"\n🎭 Mask Sparsity:")
-            logger.info(f"   Nodes: {node_sum}/{total_nodes} ({node_pct:.1f}%)")
-            logger.info(f"   Edges: {edge_sum}/{total_edges} ({edge_pct:.1f}%)")
+                node_sum = int(self.current_mask_sums.get('node', 0))
+                edge_sum = int(self.current_mask_sums.get('edge', 0))
 
-        logger.info("="*80 + "\n")
+                node_pct = node_sum / total_nodes * 100 if total_nodes > 0 else 0
+                edge_pct = edge_sum / total_edges * 100 if total_edges > 0 else 0
+
+                logger.info(f"\n🎭 Mask Sparsity:")
+                logger.info(f"   Nodes: {node_sum}/{total_nodes} ({node_pct:.1f}%)")
+                logger.info(f"   Edges: {edge_sum}/{total_edges} ({edge_pct:.1f}%)")
+
+            logger.info("="*80 + "\n")
     
     def _final_evaluation(self, test_loader: DataLoader) -> Dict[str, float]:
         """最终评估并返回结果"""

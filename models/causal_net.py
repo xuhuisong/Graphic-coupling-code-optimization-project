@@ -184,24 +184,6 @@ class CausalNet(nn.Module):
 
         return edges
     
-    def _assemble_block_diagonal(self, block_list: list) -> torch.Tensor:
-        """
-        组装块对角矩阵 (未改动)
-        """
-        B = block_list[0].shape[0]
-        P = block_list[0].shape[1]
-        num_blocks = len(block_list)
-        total_P = num_blocks * P
-        
-        device = block_list[0].device
-        large_edges = torch.zeros(B, total_P, total_P, device=device)
-        
-        for idx, block in enumerate(block_list):
-            start = idx * P
-            end = (idx + 1) * P
-            large_edges[:, start:end, start:end] = block
-        
-        return large_edges
     
     def prediction_whole(self, x, edge_prior_mask):
         edge = self.compute_dynamic_edges(x, edge_prior_mask)
@@ -235,68 +217,149 @@ class CausalNet(nn.Module):
         return self.mlp_causal(graph)
 
     def _perform_fusion_batch_level(
-        self,
-        x: torch.Tensor,  # [B, P, d]
-        labels: torch.Tensor,  # [B] - 新增参数！
-        edge_prior_mask: torch.Tensor,
-        masks: Tuple[torch.Tensor, torch.Tensor],
-        fusion_type: str
-    ) -> torch.Tensor:
-        """
-        批次内对立类别融合
+            self,
+            x: torch.Tensor,  # [B, P, d]
+            edge_prior_mask: torch.Tensor,
+            masks: Tuple[torch.Tensor, torch.Tensor],
+            fusion_type: str,
+            labels: torch.Tensor # [B]
+        ) -> torch.Tensor:
+            """
+            批次内对立类别融合 (Pre-GCN Version / 输入空间融合)
 
-        关键改进：只使用对立类别样本作为替换源
-        """
-        node_mask, edge_mask = masks
-        B, P, d = x.shape
+            核心逻辑：
+            1. 在输入空间进行特征替换 (投毒)。
+            2. 使用【原始特征】计算动态边权重 (锁定通道)。
+            3. 使用【因果边掩码】过滤边 (结构约束)。
+            4. 将融合后的特征送入 GCN，在锁定的结构上传播。
+            """
+            node_mask, edge_mask = masks
+            B, P, d = x.shape
 
-        # 1. 动态边 + 内部GCN
-        edges = self.compute_dynamic_edges(x, edge_prior_mask)
-        intrinsic_edge = edges * edge_mask.unsqueeze(0)
-        xs_stage1 = self.gcn_block(x, intrinsic_edge, node_mask)
+            # ============================================================
+            # 1. 计算替换特征 (在输入 x 上计算)
+            # ============================================================
+            replacement_x = torch.zeros_like(x)
 
-        # 2. ✅ 关键修复：为每个样本计算对立类别的聚合特征
-        replacement_features = torch.zeros_like(xs_stage1)
+            for i in range(B):
+                opposite_label = 1 - labels[i]
+                # 找到 Batch 内所有对立类别的样本
+                opposite_mask = (labels == opposite_label)
 
-        for i in range(B):
-            opposite_label = 1 - labels[i]
-            opposite_mask = (labels == opposite_label)
+                if opposite_mask.sum() > 0:
+                    # 取对立类别原始特征 x 的平均
+                    opposite_features = x[opposite_mask]
+                    replacement_x[i] = opposite_features.mean(dim=0)
+                else:
+                    # 兜底：如果没有对立类别，用除自己外的均值
+                    other_mask = torch.ones(B, dtype=torch.bool, device=x.device)
+                    other_mask[i] = False
+                    replacement_x[i] = x[other_mask].mean(dim=0)
 
-            if opposite_mask.sum() > 0:
-                # 只取对立类别样本的平均
-                opposite_features = xs_stage1[opposite_mask]
-                replacement_features[i] = opposite_features.mean(dim=0)
+            # ============================================================
+            # 2. 执行替换/融合 (Feature Mixing)
+            # ============================================================
+            # 扩展 mask 维度以匹配特征 [P, 1] -> [1, P, 1]
+            mask_intrinsic = node_mask.reshape(1, P, 1)
+            mask_spurious = 1 - mask_intrinsic
+
+            if fusion_type == "intrinsic":
+                # 内在融合 (Sensitivity Test)：破坏内在因果部分
+                # 预期结果：预测应该翻转/错误 (Loss 变大)
+                # 操作：保留虚假背景 (x * mask_spurious)，替换内在因果 (replacement * mask_intrinsic)
+                x_fused = (replacement_x * mask_intrinsic) + (x * mask_spurious)
+
+            elif fusion_type == "spurious":
+                # 虚假融合 (Invariance Test)：破坏虚假背景部分
+                # 预期结果：预测应该保持不变/正确 (Loss 变小)
+                # 操作：保留内在因果 (x * mask_intrinsic)，替换虚假背景 (replacement * mask_spurious)
+                x_fused = (x * mask_intrinsic) + (replacement_x * mask_spurious)
             else:
-                # 退化方案：用除自己外的所有样本
-                other_mask = torch.ones(B, dtype=torch.bool, device=x.device)
-                other_mask[i] = False
-                replacement_features[i] = xs_stage1[other_mask].mean(dim=0)
+                raise ValueError(f"Unknown fusion_type: {fusion_type}")
 
-        # 3. 条件替换
-        mask_intrinsic = node_mask.reshape(1, P, 1)
-        mask_spurious = 1 - mask_intrinsic
+            # ============================================================
+            # 3. 计算动态边 & 应用掩码 (关键步骤)
+            # ============================================================
+            # 关键 A: 必须用【原始 x】计算相似度权重！
+            # 目的：如果原图中两节点相似（有边），我们要保持这个通道畅通，
+            # 这样当我们在通道一端“投毒”（替换特征）时，毒素才能流过去，导致 Loss 增加，
+            # 从而倒逼模型去学习切断这条边（即让 edge_mask -> 0）。
+            edges = self.compute_dynamic_edges(x, edge_prior_mask)
 
-        if fusion_type == "intrinsic":
-            x_fused = (replacement_features * mask_intrinsic) + (xs_stage1 * mask_spurious)
-        elif fusion_type == "spurious":
-            x_fused = (xs_stage1 * mask_intrinsic) + (replacement_features * mask_spurious)
-        else:
-            raise ValueError(f"Unknown fusion_type: {fusion_type}")
+            # 关键 B: 必须用【因果边掩码】进行过滤！
+            # 目的：只在模型认为“因果相关”的结构上传播特征。
+            # 只有当 edge_mask 为 0 时，即使通道畅通，毒素也被物理切断。
+            intrinsic_edge = edges * edge_mask.unsqueeze(0)
 
-        # 4. 预测
-        graph = readout(x_fused)
-        logits = self.mlp_causal(graph)
+            # ============================================================
+            # 4. GCN 卷积
+            # ============================================================
+            # 在【旧的结构(intrinsic_edge)】上跑【新的特征(x_fused)】
+            # node_mask 传给 gcn_block 主要用于归一化，保持一致性
+            xs_out = self.gcn_block(x_fused, intrinsic_edge, node_mask)
 
-        return logits
+            # ============================================================
+            # 5. 预测
+            # ============================================================
+            graph = readout(xs_out)
+            logits = self.mlp_causal(graph)
 
-    # 更新对外接口（新增 labels 参数）
-    def prediction_spurious_fusion(self, x, labels, edge_prior_mask, masks):
-        return self._perform_fusion_batch_level(
-            x, labels, edge_prior_mask, masks, fusion_type="spurious"
-        )
+            return logits
 
-    def prediction_intrinsic_fusion(self, x, labels, edge_prior_mask, masks):
-        return self._perform_fusion_batch_level(
-            x, labels, edge_prior_mask, masks, fusion_type="intrinsic"
-        )
+        # 更新对外接口（新增 labels 参数）
+    def prediction_spurious_fusion(self, x, edge_prior_mask, masks, labels):
+        return self._perform_fusion_batch_level(x, edge_prior_mask, masks, fusion_type="spurious", labels=labels)
 
+        # 2. 修正 prediction_intrinsic_fusion (如果有用到，也一并检查)
+    def prediction_intrinsic_fusion(self, x, edge_prior_mask, masks, labels):
+        return self._perform_fusion_batch_level(x, edge_prior_mask, masks, fusion_type="intrinsic", labels=labels)
+    
+
+    def compute_prototype_divergence(
+            self, 
+            x: torch.Tensor, 
+            masks: Tuple[torch.Tensor, torch.Tensor], 
+            labels: torch.Tensor,
+            mining_ratio: float = 0.5  # 动态传入的比例
+        ) -> torch.Tensor:
+            """
+            计算因果原型的类间分离度损失 (Top-K Hard Mining 版本)
+            """
+            node_mask = masks[0] # [P]
+            B, P, d = x.shape
+
+            # 1. 获取加权的因果特征 (使用卷积前的原始特征)
+            masked_x = x * node_mask.view(1, P, 1)
+
+            # 2. 分离正负样本
+            labels = labels.view(-1)
+            idx_0 = (labels == 0).nonzero(as_tuple=True)[0]
+            idx_1 = (labels == 1).nonzero(as_tuple=True)[0]
+
+            # 异常保护
+            if len(idx_0) == 0 or len(idx_1) == 0:
+                return torch.tensor(0.0, device=x.device)
+
+            # 3. 计算类原型 (Class Prototypes)
+            proto_0 = masked_x[idx_0].mean(dim=0)
+            proto_1 = masked_x[idx_1].mean(dim=0)
+
+            # 4. 计算节点级的欧氏距离
+            # distance[i] 越小，说明该节点越无法区分 AD/CN
+            distance = torch.norm(proto_0 - proto_1, p=2, dim=-1) # [P]
+
+            # 5. 计算逐节点损失 (Raw Loss)
+            # exp(-distance)：距离越小，Loss 越大
+            scale = 1.0 
+            raw_loss = node_mask * torch.exp(-scale * distance) # [P]
+
+            # 6. Top-K Hard Mining
+            # 动态确定 K：只惩罚被激活节点中最差的 mining_ratio 比例
+            num_active = node_mask.sum().detach().item()
+            k = int(max(1, num_active * mining_ratio))
+            k = min(k, P) # 边界保护
+
+            # 选取 Loss 最大的 K 个节点 (即距离最小的困难节点)
+            topk_loss, _ = torch.topk(raw_loss, k=k)
+
+            return topk_loss.mean()
