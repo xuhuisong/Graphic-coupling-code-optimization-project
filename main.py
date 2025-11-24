@@ -21,7 +21,7 @@ from core.trainer import CausalTrainer
 from data.dataset import PatchDataset, get_fold_splits
 from torch.utils.data import DataLoader, Subset
 from data.dataset import collate_fn
-
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -56,17 +56,6 @@ def run_training_for_fold(
 ) -> dict:
     """
     运行单个 fold 的训练
-    
-    Args:
-        config: 配置字典
-        fold: fold 索引
-        densenet_model: 预训练的 DenseNet 模型
-        edge_matrix: 图边矩阵
-        checkpoint_manager: 缓存管理器
-        exp_dir: 实验目录
-        
-    Returns:
-        训练结果字典
     """
     logger.info(f"\n{'='*80}")
     logger.info(f"📂 Fold {fold}/{config['data']['num_folds']-1}")
@@ -75,6 +64,18 @@ def run_training_for_fold(
     # 1. 准备数据
     data_dir = os.path.join(config['data']['data_dir'], config['data']['data_name'])
     dataset = PatchDataset(data_dir)
+    
+    # 【新增】尝试加载坐标文件
+    coordinates = None
+    coord_path = os.path.join(data_dir, 'coordinates.npy')
+    if os.path.exists(coord_path):
+        try:
+            coordinates = np.load(coord_path)
+            logger.info(f"📍 Loaded coordinates from: {coord_path} (Shape: {coordinates.shape})")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load coordinates: {e}")
+    else:
+        logger.warning(f"⚠️ Coordinates file not found at {coord_path}")
     
     # 获取数据分割
     train_indices, val_indices, test_indices = get_fold_splits(
@@ -95,10 +96,10 @@ def run_training_for_fold(
         batch_size=config['train']['batch_size'],
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=config['densenet']['pretrain']['num_workers'],  # 🔧 使用配置的值
-        pin_memory=True,       # ✅ 保持
-        persistent_workers=True,  # 🔧 新增：避免每epoch重启worker
-        prefetch_factor=4      # 🔧 新增：预加载4个batch
+        num_workers=config['densenet']['pretrain']['num_workers'],
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
 
     val_loader = DataLoader(
@@ -139,7 +140,8 @@ def run_training_for_fold(
         checkpoint_manager=checkpoint_manager,
         work_dir=str(work_dir),
         device='cuda',
-        rank=0
+        rank=0,
+        coordinates=coordinates  # 【新增】传递坐标
     )
     
     logger.info("✅ Trainer initialized")
@@ -156,7 +158,6 @@ def run_training_for_fold(
     logger.info(f"   Test Acc: {results['test_acc']:.4f}")
     
     return results
-
 
 def main():
     """主函数"""

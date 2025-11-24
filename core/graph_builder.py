@@ -42,31 +42,34 @@ class GraphBuilder:
     """
     
     def __init__(
-        self,
-        data_dir: str,
-        checkpoint_manager: CheckpointManager,
-        densenet_manager: DenseNetManager,
-        config: Optional[Dict[str, Any]] = None
-    ):
-        self.data_dir = data_dir
-        self.checkpoint_manager = checkpoint_manager
-        self.densenet_manager = densenet_manager
-        
-        # 默认配置
-        self.config = {
-            'similarity_threshold': 0.7,      # patch间相似度阈值
-            'frequency_threshold': 0.3,       # 边在患者中的最小出现频率
-            'similarity_metric': 'cosine',    # 相似度计算方式: 'cosine', 'euclidean'
-            'batch_size': 64,                 # 相似度计算批次大小
-            'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-            'use_all_data': True,             # 是否使用全部数据构建边（推荐True）
-        }
-        
-        # 更新用户配置
-        if config:
-            self.config.update(config)
-        
-        logger.info(f"GraphBuilder initialized with config: {self.config}")
+            self,
+            data_dir: str,
+            checkpoint_manager: CheckpointManager,
+            densenet_manager: DenseNetManager,
+            config: Optional[Dict[str, Any]] = None
+        ):
+            self.data_dir = data_dir
+            self.checkpoint_manager = checkpoint_manager
+            self.densenet_manager = densenet_manager
+
+            # 默认配置
+            self.config = {
+                'similarity_threshold': 0.7,
+                'frequency_threshold': 0.3,
+                'similarity_metric': 'cosine',
+                'batch_size': 64,
+                'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+                'use_all_data': True,
+                # 【新增】空间正则化配置
+                'use_spatial_weight': True,  # 是否启用空间加权
+                'spatial_sigma': 48.0,       # 高斯核带宽 (通常设为 Patch Size 的 2 倍)
+            }
+
+            # 更新用户配置
+            if config:
+                self.config.update(config)
+
+            logger.info(f"GraphBuilder initialized with config: {self.config}")
     
     def get_edge_prior_mask(
         self,
@@ -215,68 +218,81 @@ class GraphBuilder:
         return features
     
     def _compute_patient_edges(self, all_features: np.ndarray) -> np.ndarray:
-        """
-        计算每个患者内部的边
+            """
+            计算每个患者内部的边 (增加空间距离加权)
+            """
+            num_patients, num_patches, feature_dim = all_features.shape
 
-        [修改] 使用 TOP-K 策略替代固定阈值
+            # 初始化结果
+            patient_edges = np.zeros((num_patients, num_patches, num_patches), dtype=np.uint8)
 
-        Args:
-            all_features: 所有特征 [N, P, feature_dim]
+            device = torch.device(self.config['device'])
+            k_neighbors = self.config.get('k_neighbors', 20)
 
-        Returns:
-            患者边矩阵 [N, P, P]
-        """
-        num_patients, num_patches, feature_dim = all_features.shape
+            # ============================================================
+            # 【新增】预计算空间权重矩阵
+            # ============================================================
+            spatial_weight = None
+            if self.config['use_spatial_weight']:
+                coord_path = os.path.join(self.data_dir, 'coordinates.npy')
+                if os.path.exists(coord_path):
+                    logger.info(f"📍 Loading coordinates from {coord_path}")
+                    try:
+                        coords = np.load(coord_path)  # [P, 3]
+                        if coords.shape[0] != num_patches:
+                            logger.warning(f"⚠️ Coordinate shape mismatch: {coords.shape} vs {num_patches}. Skipping spatial weight.")
+                        else:
+                            coords_tensor = torch.from_numpy(coords).float().to(device)
+                            # 计算欧氏距离矩阵 [P, P]
+                            dist_matrix = torch.cdist(coords_tensor, coords_tensor, p=2)
 
-        # 初始化结果
-        patient_edges = np.zeros((num_patients, num_patches, num_patches), dtype=np.uint8)
+                            # 计算高斯权重: exp(-d^2 / (2*sigma^2))
+                            sigma = self.config['spatial_sigma']
+                            spatial_weight = torch.exp(- (dist_matrix ** 2) / (2 * sigma ** 2))
+                            logger.info(f"✅ Spatial weighting enabled (sigma={sigma})")
+                    except Exception as e:
+                        logger.error(f"❌ Failed to load coordinates: {e}")
+                else:
+                    logger.warning(f"⚠️ Coordinates file not found at {coord_path}, skipping spatial weight.")
 
-        device = torch.device(self.config['device'])
+            logger.info(f"Computing edges for {num_patients} patients...")
 
-        # 【修改】使用 TOP-K 替代阈值
-        k_neighbors = self.config.get('k_neighbors', 20)  # 每个节点保留TOP-20邻居
+            # 逐患者计算
+            for i in tqdm(range(num_patients), desc="Computing patient edges"):
+                patient_features = torch.FloatTensor(all_features[i]).to(device)
 
-        logger.info(f"Computing edges for {num_patients} patients...")
-        logger.info(f"Using TOP-K strategy with K={k_neighbors}")
+                # 1. 计算特征相似度
+                if self.config['similarity_metric'] == 'cosine':
+                    similarity_matrix = self._compute_cosine_similarity(patient_features)
+                elif self.config['similarity_metric'] == 'euclidean':
+                    similarity_matrix = self._compute_euclidean_similarity(patient_features)
+                else:
+                    raise ValueError(f"Unknown similarity metric: {self.config['similarity_metric']}")
 
-        # 逐患者计算
-        for i in tqdm(range(num_patients), desc="Computing patient edges"):
-            patient_features = torch.FloatTensor(all_features[i]).to(device)  # [P, feature_dim]
+                # 2. 【新增】应用空间加权 (特征相似度 * 空间亲和度)
+                if spatial_weight is not None:
+                    similarity_matrix = similarity_matrix * spatial_weight
 
-            # 计算相似度矩阵
-            if self.config['similarity_metric'] == 'cosine':
-                similarity_matrix = self._compute_cosine_similarity(patient_features)
-            elif self.config['similarity_metric'] == 'euclidean':
-                similarity_matrix = self._compute_euclidean_similarity(patient_features)
-            else:
-                raise ValueError(f"Unknown similarity metric: {self.config['similarity_metric']}")
+                # 3. TOP-K 选择 (基于加权后的相似度)
+                # +1 是因为自己和自己相似度最高，需要排除
+                topk_values, topk_indices = torch.topk(similarity_matrix, k=k_neighbors+1, dim=1)
 
-            # 【关键修改】TOP-K 选择
-            # 对每一行（每个节点），找到最相似的K个邻居
-            topk_values, topk_indices = torch.topk(similarity_matrix, k=k_neighbors+1, dim=1)
-            # +1 是因为自己和自己相似度最高，需要排除
+                # 4. 构建稀疏边矩阵
+                edges = torch.zeros_like(similarity_matrix, dtype=torch.uint8)
+                for node_idx in range(num_patches):
+                    neighbors = topk_indices[node_idx, 1:]
+                    # 同时满足TOP-K和阈值
+                    for neighbor in neighbors:
+                        if similarity_matrix[node_idx, neighbor] >= self.config['similarity_threshold']:
+                            edges[node_idx, neighbor] = 1
 
-            # 构建稀疏边矩阵
-            edges = torch.zeros_like(similarity_matrix, dtype=torch.uint8)
-            for node_idx in range(num_patches):
-                neighbors = topk_indices[node_idx, 1:]
-                # 【新增】同时满足TOP-K和阈值
-                for neighbor in neighbors:
-                    if similarity_matrix[node_idx, neighbor] >= self.config['similarity_threshold']:
-                        edges[node_idx, neighbor] = 1
+                # 互选
+                edges = edges & edges.t()
+                edges.fill_diagonal_(0)
 
-            # 互选
-            edges = edges & edges.t()
-            edges.fill_diagonal_(0)
+                patient_edges[i] = edges.cpu().numpy()
 
-            patient_edges[i] = edges.cpu().numpy()
-
-        # 统计信息
-        avg_edges_per_patient = np.mean([np.sum(patient_edges[i]) for i in range(num_patients)])
-        logger.info(f"Average edges per patient: {avg_edges_per_patient:.1f}")
-        logger.info(f"Theoretical max (K={k_neighbors}, undirected): {num_patches * k_neighbors}")
-
-        return patient_edges
+            return patient_edges
     
     def _compute_cosine_similarity(self, features: torch.Tensor) -> torch.Tensor:
         """

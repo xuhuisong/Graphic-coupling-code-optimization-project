@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
+import numpy as np
 
 
 class GCN(nn.Module):
@@ -131,55 +132,87 @@ class CausalNet(nn.Module):
     """
     
     def __init__(
-        self,
-        num_class: int,
-        feature_dim: int,
-        hidden1: list, # (未使用，但保留签名)
-        hidden2: list,
-        num_patches: int,
-        kernels: Optional[list] = None, # (未使用，但保留签名)
-        num_neg_samples: int = 4
-    ):
+            self,
+            num_class: int,
+            feature_dim: int,
+            hidden1: list,
+            hidden2: list,
+            num_patches: int,
+            kernels: Optional[list] = None,
+            num_neg_samples: int = 4,
+            # 【新增】坐标参数
+            coordinates: Optional[np.ndarray] = None,
+            spatial_sigma: float = 48.0
+        ):
+        
         super(CausalNet, self).__init__()
         
         self.num_neg_samples_default = num_neg_samples
         self.num_class = num_class
         self.feature_dim = feature_dim
-        self.num_patches = num_patches # 对应 P
+        self.num_patches = num_patches
         self.hidden2 = hidden2
         
-        # GCN 模块（用于子图内部特征提取）
+        # GCN 模块
         self.gcn_block = GCNBlock(
             in_dim=feature_dim,
             hidden=hidden2
         )
         
-        # 因果MLP（所有因果路径共用）
+        # 因果MLP
         causal_feature_size = hidden2[-1] * num_patches
         self.mlp_causal = nn.Sequential(
             nn.Linear(causal_feature_size, 128),
             nn.ReLU(True),
             nn.Dropout(0.2),
             nn.Linear(128, num_class))
-    
-    
+            
+        # ============================================================
+        # 【新增】预计算空间权重 Buffer
+        # ============================================================
+        self.use_spatial = False
+        if coordinates is not None:
+            self.use_spatial = True
+            # 计算距离矩阵 [P, P]
+            coords_tensor = torch.from_numpy(coordinates).float()
+            dist_matrix = torch.cdist(coords_tensor, coords_tensor, p=2)
+            
+            # 计算高斯权重
+            spatial_weight = torch.exp(- (dist_matrix ** 2) / (2 * spatial_sigma ** 2))
+            
+            # 注册为 Buffer (自动随模型移动到 GPU，不更新梯度)
+            self.register_buffer('spatial_weight', spatial_weight)
+            print(f"✅ CausalNet: Spatial weighting enabled (sigma={spatial_sigma})")
+
+
     def compute_dynamic_edges(
         self,
         x: torch.Tensor,
         edge_prior_mask: torch.Tensor
     ) -> torch.Tensor:
-        """【简化版】动态边计算"""
+        """
+        动态边计算 (融合空间位置)
+        """
         B, P, d = x.shape
 
+        # 1. 计算特征相似度 [B, P, P]
         x_norm = F.normalize(x, p=2, dim=2)
         similarity = torch.bmm(x_norm, x_norm.transpose(1, 2))
-        similarity = (similarity + 1) / 2
+        similarity = (similarity + 1) / 2  # 归一化到 [0, 1]
 
+        # 2. 【新增】融合空间权重
+        # 如果启用了空间权重，将特征相似度乘以空间亲和度
+        if self.use_spatial:
+            # spatial_weight 是 [P, P]，利用广播机制自动应用到 [B, P, P]
+            similarity = similarity * self.spatial_weight
+
+        # 3. 应用先验掩码 (Edge Prior)
+        # 仅保留先验图中存在的边
         mask_expanded = edge_prior_mask.unsqueeze(0).expand(B, -1, -1)
         edges = similarity * mask_expanded
 
-        # 移除自环
-        identity = torch.eye(P, device=edges.device).unsqueeze(0).expand(B, -1, -1)
+        # 4. 移除自环
+        identity = torch.eye(P, device=edges.device).unsqueeze(0)
         edges = edges * (1 - identity)
 
         return edges

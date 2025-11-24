@@ -1,5 +1,5 @@
 # =====================================================
-# 统一训练配置文件（优化版）
+# 统一训练配置文件（最终优化版）
 # =====================================================
 
 # 基本配置
@@ -35,12 +35,15 @@ densenet:
 # 图边构建配置
 graph:
   build:
-    k_neighbors: 20              
+    k_neighbors: 10              # 🔧 [修改] 从 5 提至 20，扩大候选范围，避免漏掉潜在因果边
     frequency_threshold: 0.3
-    similarity_threshold: 0.7  # 双重筛选
+    similarity_threshold: 0.7  
     similarity_metric: cosine
     batch_size: 64
     use_all_data: true
+    # 👇 [新增] 空间正则化参数
+    use_spatial_weight: true     # 开启距离加权
+    spatial_sigma: 48.0          # 高斯核带宽 (建议 Patch Size * 2)
   params:
     node_type: px
     edge_type: abscorr
@@ -50,34 +53,31 @@ graph:
 # 主训练配置
 train:
   folds: [0, 1, 2, 3, 4]
-  pre_epoch: 30
-  num_epoch: 110
-  stage_transition_epoch: 70
-  batch_size: 72          # 🔧 增加批次大小 (每GPU 24个)
+  pre_epoch: 40
+  num_epoch: 180
+  stage_transition_epoch: 100   # 在第 80 轮重启学习率进入 Stage 2
+  batch_size: 72           # 🔧 增加批次大小 (每GPU 24个)
   test_batch_size: 66
   
   # 优化器
   optimizer: SGD
   base_lr: 0.0003
-  base_lr_mask: 4
+  base_lr_mask: 4.0            # 
   weight_decay_adamw: 0.01
   weight_decay: 0.0005
   nesterov: true
-  scheduler: auto
-  stepsize: 30
-  gamma: 0.7
+  scheduler: auto              # 代码现已强制使用 CosineAnnealingLR
   
-  # 稀疏度正则化预热（新增）
+  # 稀疏度正则化
   loss_weights:
-    L_inv: 0
-    L_sen: 0.5
+    L_inv: 0.5
+    L_sen: 0      # 暂时关闭 Sensitivity 测试，先专注 Invariance
     L_pred: 1
     L_spu: 1
     lambda_l1: 0
-    lambda_sparsity: 0.2
-    lambda_edge_multiplier: 6.0  # 新增这一行
-
-  sparsity_warmup_epochs: 15
+    lambda_sparsity: 0.15       # 🔧 [修改] 适当增加稀疏惩罚 (0.1 -> 0.2)
+    lambda_proto: 1.0
+    lambda_edge_multiplier: 4  # 🔧 [修改] 大幅增加边的惩罚权重 (2 -> 5)，强迫切断长距离弱连接
 
 # 模型配置
 model:
