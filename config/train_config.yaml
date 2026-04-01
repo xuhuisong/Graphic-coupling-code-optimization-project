@@ -23,10 +23,10 @@ cache:
 densenet:
   pretrain:
     num_epochs: 70
-    batch_size: 48        # 🔧 增加批次大小 (每GPU 16个)
+    batch_size: 48        
     learning_rate: 0.0005
     weight_decay: 0.0001
-    num_workers: 16       # 🔧 增加数据加载线程 (4倍GPU数)
+    num_workers: 16       
     patience: 40
   model:
     growth_rate: 8
@@ -35,15 +35,15 @@ densenet:
 # 图边构建配置
 graph:
   build:
-    k_neighbors: 10              # 🔧 [修改] 从 5 提至 20，扩大候选范围，避免漏掉潜在因果边
+    k_neighbors: 10              
     frequency_threshold: 0.3
     similarity_threshold: 0.7  
     similarity_metric: cosine
     batch_size: 64
     use_all_data: true
     # 👇 [新增] 空间正则化参数
-    use_spatial_weight: true     # 开启距离加权
-    spatial_sigma: 48.0          # 高斯核带宽 (建议 Patch Size * 2)
+    use_spatial_weight: true     
+    spatial_sigma: 48.0          
   params:
     node_type: px
     edge_type: abscorr
@@ -53,31 +53,31 @@ graph:
 # 主训练配置
 train:
   folds: [0, 1, 2, 3, 4]
-  pre_epoch: 40
-  num_epoch: 180
-  stage_transition_epoch: 100   # 在第 80 轮重启学习率进入 Stage 2
-  batch_size: 72           # 🔧 增加批次大小 (每GPU 24个)
+  pre_epoch: 0
+  num_epoch: 300
+  stage_transition_epoch: 150  
+  batch_size: 72           
   test_batch_size: 66
   
   # 优化器
   optimizer: SGD
-  base_lr: 0.0003
-  base_lr_mask: 4.0            # 
+  base_lr: 0.00005
+  base_lr_mask: 1            # 
   weight_decay_adamw: 0.01
   weight_decay: 0.0005
   nesterov: true
-  scheduler: auto              # 代码现已强制使用 CosineAnnealingLR
+  scheduler: auto             
   
   # 稀疏度正则化
   loss_weights:
     L_inv: 0.5
-    L_sen: 0      # 暂时关闭 Sensitivity 测试，先专注 Invariance
+    L_sen: 0.25      
     L_pred: 1
     L_spu: 1
     lambda_l1: 0
-    lambda_sparsity: 0.15       # 🔧 [修改] 适当增加稀疏惩罚 (0.1 -> 0.2)
+    lambda_sparsity: 0.15       
     lambda_proto: 1.0
-    lambda_edge_multiplier: 4  # 🔧 [修改] 大幅增加边的惩罚权重 (2 -> 5)，强迫切断长距离弱连接
+    lambda_edge_multiplier: 1.5 
 
 # 模型配置
 model:
@@ -91,7 +91,7 @@ model:
 # 其他配置
 misc:
   device: [0, 1, 2]
-  gumble_tau: 1
+  gumble_tau: 0.1
   log_interval: 100
   save_interval: 5
   eval_interval: 5

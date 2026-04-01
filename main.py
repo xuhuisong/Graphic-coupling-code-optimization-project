@@ -22,6 +22,7 @@ from data.dataset import PatchDataset, get_fold_splits
 from torch.utils.data import DataLoader, Subset
 from data.dataset import collate_fn
 import numpy as np
+from core.feature_cache import FeatureCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +62,10 @@ def run_training_for_fold(
     logger.info(f"📂 Fold {fold}/{config['data']['num_folds']-1}")
     logger.info(f"{'='*80}\n")
     
-    # 1. 准备数据
+    # 1. 准备数据路径
     data_dir = os.path.join(config['data']['data_dir'], config['data']['data_name'])
-    dataset = PatchDataset(data_dir)
     
-    # 【新增】尝试加载坐标文件
+    # 【新增】加载坐标文件
     coordinates = None
     coord_path = os.path.join(data_dir, 'coordinates.npy')
     if os.path.exists(coord_path):
@@ -77,6 +77,36 @@ def run_training_for_fold(
     else:
         logger.warning(f"⚠️ Coordinates file not found at {coord_path}")
     
+    # ============================================================
+    # [新增] 步骤1：预计算特征
+    # ============================================================
+    logger.info("\n" + "-"*80)
+    logger.info("🔧 Step 1: Computing/Loading precomputed features...")
+    logger.info("-"*80)
+    
+    feature_manager = FeatureCacheManager(
+        data_dir=data_dir,
+        checkpoint_manager=checkpoint_manager,
+        densenet_model=densenet_model
+    )
+    
+    # 获取所有样本的特征 [N, P, feature_dim]
+    all_features = feature_manager.get_or_compute_features(
+        fold=fold,
+        split_seed=config['split_seed'],
+        batch_size=config['densenet']['pretrain'].get('feature_extract_batch_size', 64)
+    )
+    
+    logger.info(f"✅ Features ready: {all_features.shape}")
+    
+    # ============================================================
+    # [修改] 步骤2：创建数据集（使用预计算特征）
+    # ============================================================
+    dataset = PatchDataset(
+        data_dir,
+        precomputed_features=all_features
+    )
+    
     # 获取数据分割
     train_indices, val_indices, test_indices = get_fold_splits(
         data_dir,
@@ -85,7 +115,7 @@ def run_training_for_fold(
         num_folds=config['data']['num_folds']
     )
     
-    logger.info(f"📊 Data split:")
+    logger.info(f"\n📊 Data split:")
     logger.info(f"   Train: {len(train_indices)} samples")
     logger.info(f"   Val:   {len(val_indices)} samples")
     logger.info(f"   Test:  {len(test_indices)} samples")
@@ -124,9 +154,11 @@ def run_training_for_fold(
         prefetch_factor=4
     )
     
-    # 2. 创建训练器
+    # ============================================================
+    # [修改] 步骤3：创建训练器
+    # ============================================================
     logger.info("\n" + "-"*80)
-    logger.info("🔧 Initializing trainer...")
+    logger.info("🔧 Step 2: Initializing trainer...")
     logger.info("-"*80)
     
     work_dir = exp_dir / f"fold_{fold}"
@@ -141,14 +173,15 @@ def run_training_for_fold(
         work_dir=str(work_dir),
         device='cuda',
         rank=0,
-        coordinates=coordinates  # 【新增】传递坐标
+        coordinates=coordinates,
+        use_feature_cache=True  # [新增] 启用特征缓存模式
     )
     
     logger.info("✅ Trainer initialized")
     
     # 3. 开始训练
     logger.info("\n" + "="*80)
-    logger.info("🚀 Starting training...")
+    logger.info("🚀 Step 3: Starting training...")
     logger.info("="*80)
     
     results = trainer.train(train_loader, val_loader, test_loader)
@@ -158,6 +191,7 @@ def run_training_for_fold(
     logger.info(f"   Test Acc: {results['test_acc']:.4f}")
     
     return results
+
 
 def main():
     """主函数"""

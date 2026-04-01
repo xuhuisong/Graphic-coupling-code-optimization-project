@@ -1,6 +1,10 @@
 """
 Dataset Classes for Patch-based Medical Image Processing
 用于基于patch的医学影像数据加载
+
+[新增功能]:
+- 支持预计算特征模式（Feature Cache Mode）
+- 保留原始patch模式用于特征提取
 """
 
 import os
@@ -8,23 +12,39 @@ import pickle
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 
 class PatchDataset(Dataset):
     """
     Patch数据集
     
-    [修改版]:
-    1. __init__ 接受一个可选的 transform。
-    2. __getitem__ 应用 Z-Score 归一化。
-    3. __getitem__ 以 (C, H, W, D) 格式应用 transform，以实现快速、一致的增强。
-    4. __getitem__ 最终返回 (P, 1, D, H, W) 以匹配模型的输入。
+    [支持两种工作模式]:
+    1. 原始模式 (precomputed_features=None):
+       - 返回原始patches [P, 1, D, H, W]
+       - 用于DenseNet特征提取阶段
+       - 应用Z-Score归一化和数据增强
+    
+    2. 特征模式 (precomputed_features!=None):
+       - 直接返回预计算的特征 [P, feature_dim]
+       - 用于主训练阶段（跳过特征提取）
+       - 大幅提升GPU利用率
+    
+    Args:
+        data_dir: 数据目录路径
+        transform: MONAI数据增强变换（仅在原始模式使用）
+        precomputed_features: 预计算特征数组 [N, P, feature_dim] (可选)
     """
     
-    def __init__(self, data_dir: str, transform = None): # <--- 修改点 1
+    def __init__(
+        self, 
+        data_dir: str, 
+        transform=None,
+        precomputed_features: Optional[np.ndarray] = None
+    ):
         self.data_dir = data_dir
-        self.transform = transform # <--- 修改点 2
+        self.transform = transform
+        self.precomputed_features = precomputed_features
         
         # 加载数据
         data_path = os.path.join(data_dir, 'data.npy')
@@ -35,8 +55,13 @@ class PatchDataset(Dataset):
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"Label file not found: {label_path}")
         
-        self.all_patches = np.load(data_path, mmap_mode='r')
+        # [原始模式] 加载原始patches（只在非特征模式时需要）
+        if precomputed_features is None:
+            self.all_patches = np.load(data_path, mmap_mode='r')
+        else:
+            self.all_patches = None  # 节省内存
         
+        # 加载标签和subject_ids
         with open(label_path, 'rb') as f:
             loaded_data = pickle.load(f)
             self.labels = loaded_data[0]
@@ -44,13 +69,20 @@ class PatchDataset(Dataset):
             
         if not isinstance(self.labels, np.ndarray):
             self.labels = np.array(self.labels)
-            
-        assert len(self.all_patches) == len(self.labels), \
-            f"Data-label mismatch: {len(self.all_patches)} vs {len(self.labels)}"
         
-        self.num_samples = len(self.labels)
-        self.num_patches = self.all_patches.shape[1]
-        self.patch_shape = self.all_patches.shape[2:]
+        # 验证数据一致性
+        if precomputed_features is not None:
+            assert len(precomputed_features) == len(self.labels), \
+                f"Feature-label mismatch: {len(precomputed_features)} vs {len(self.labels)}"
+            self.num_samples = len(self.labels)
+            self.num_patches = precomputed_features.shape[1]
+            self.feature_dim = precomputed_features.shape[2]
+        else:
+            assert len(self.all_patches) == len(self.labels), \
+                f"Data-label mismatch: {len(self.all_patches)} vs {len(self.labels)}"
+            self.num_samples = len(self.labels)
+            self.num_patches = self.all_patches.shape[1]
+            self.patch_shape = self.all_patches.shape[2:]
     
     def __len__(self) -> int:
         return self.num_samples
@@ -59,10 +91,32 @@ class PatchDataset(Dataset):
         """
         获取单个样本
         
-        Returns:
+        [特征模式] Returns:
+            features: 特征tensor [P, feature_dim]
+            subject_id: 患者ID
+            label: 类别标签
+        
+        [原始模式] Returns:
             patches: patch tensor [P, 1, D, H, W]
-            ...
+            subject_id: 患者ID
+            label: 类别标签
         """
+        label = int(self.labels[idx])
+        subject_id = self.subject_ids[idx]
+        
+        # ============================================================
+        # [特征模式] 直接返回预计算的特征
+        # ============================================================
+        if self.precomputed_features is not None:
+            features = torch.from_numpy(
+                self.precomputed_features[idx]
+            ).float()  # [P, feature_dim]
+            
+            return features, subject_id, label
+        
+        # ============================================================
+        # [原始模式] 返回原始patches（用于特征提取）
+        # ============================================================
         # 1. 加载数据 (P, D, H, W)
         subject_patches = np.array(self.all_patches[idx])
         
@@ -80,10 +134,7 @@ class PatchDataset(Dataset):
             patches_tensor = self.transform(patches_tensor)
             
         # 5. 增加通道维度，以匹配模型输入
-        patches_tensor = patches_tensor.unsqueeze(1) # Shape: (P, 1, D, H, W)
-        
-        label = int(self.labels[idx])
-        subject_id = self.subject_ids[idx]
+        patches_tensor = patches_tensor.unsqueeze(1)  # Shape: (P, 1, D, H, W)
         
         return patches_tensor, subject_id, label
         
@@ -91,26 +142,37 @@ class PatchDataset(Dataset):
         return self.num_patches
     
     def get_patch_shape(self) -> Tuple[int, ...]:
-        return self.patch_shape
+        """获取patch形状（仅在原始模式可用）"""
+        if hasattr(self, 'patch_shape'):
+            return self.patch_shape
+        else:
+            raise AttributeError("Patch shape not available in feature mode")
+
 
 def collate_fn(batch: List[Tuple]) -> Tuple[torch.Tensor, List[str], torch.Tensor]:
     """
     自定义batch整理函数
     
+    [特征模式]:
+        batch_data: [B, P, feature_dim]
+    
+    [原始模式]:
+        batch_patches: [B, P, 1, D, H, W]
+    
     Args:
         batch: 数据列表
         
     Returns:
-        batch_patches: [B, P, 1, D, H, W]
+        batch_data: [B, P, ...] (特征或patches)
         patient_ids: [B]
         batch_labels: [B]
     """
-    patches, patient_ids, labels = zip(*batch)
+    data, patient_ids, labels = zip(*batch)
     
-    batch_patches = torch.stack(patches)
+    batch_data = torch.stack(data)
     batch_labels = torch.tensor(labels, dtype=torch.long)
     
-    return batch_patches, list(patient_ids), batch_labels
+    return batch_data, list(patient_ids), batch_labels
 
 
 def get_fold_splits(

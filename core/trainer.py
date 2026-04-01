@@ -58,8 +58,8 @@ class CausalTrainer:
             work_dir: str,
             device: str = 'cuda',
             rank: int = 0,
-            # 【新增】接收坐标数据
-            coordinates: Optional[np.ndarray] = None
+            coordinates: Optional[np.ndarray] = None,
+            use_feature_cache: bool = True
         ):
         self.config = config
         self.fold = fold
@@ -69,23 +69,27 @@ class CausalTrainer:
         self.work_dir = work_dir
         self.device = device
         self.rank = rank
-        
-        # 【新增】保存坐标
         self.coordinates = coordinates
-        
+        self.use_feature_cache = use_feature_cache
+
         # 冻结DenseNet特征提取器
         for param in self.densenet_model.parameters():
             param.requires_grad = False
         self.densenet_model.eval()
-        
-        # 多GPU处理
-        if torch.cuda.device_count() > 1:
-            num_gpus = torch.cuda.device_count()
-            self.densenet_model = nn.DataParallel(self.densenet_model)
-            self.feature_extract_batch_size = 64 * num_gpus
-        else:
+
+        if use_feature_cache:
+            logger.info("✅ Feature cache enabled - DenseNet frozen")
             self.feature_extract_batch_size = 32
-        
+        else:
+            logger.warning("⚠️ Feature cache disabled - GPU utilization may be low!")
+            # 多GPU处理
+            if torch.cuda.device_count() > 1:
+                num_gpus = torch.cuda.device_count()
+                self.densenet_model = nn.DataParallel(self.densenet_model)
+                self.feature_extract_batch_size = 64 * num_gpus
+            else:
+                self.feature_extract_batch_size = 32
+
         # 初始化占位符
         self.model = None
         self.mask = None
@@ -95,7 +99,7 @@ class CausalTrainer:
         self.lr_scheduler = None
         self.lr_scheduler_mask = None
         self.scheduler_pretrain = None
-        
+
         # 状态追踪变量
         self.global_step = 0
         self.pretrain_best_val_acc = 0.0
@@ -107,17 +111,17 @@ class CausalTrainer:
         self.best_model_state = None
         self.epoch_results = {}
         self.current_mask_sums = {}
-        
+
         # 损失函数
         self.criterion = nn.CrossEntropyLoss(reduction='none')
         self.lambda_l1 = config['train']['loss_weights']['lambda_l1']
-        
+
         # Mask 监控器
         self.mask_monitor = MaskMonitor(
             save_dir=str(Path(work_dir).parent),
             fold=fold
         )
-        
+
         logger.info(f"✅ Trainer initialized for Fold {fold}")
 
 
@@ -770,54 +774,60 @@ class CausalTrainer:
         }
     
     def _compute_stage2_mask_loss(self, x, masks, label, epoch, edge_prior_mask):
-            """阶段2 Mask损失 (Final Version)"""
+            """阶段2 Mask损失 (Final Version - Added Sensitivity Loss)"""
             model = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
 
-            # 1. 基础预测
+            # 1. 基础预测 (L_pred)
             y_pred = model.prediction_intrinsic_path(x, edge_prior_mask, masks)
             loss_pred = self.criterion(y_pred, label).mean()
 
-            # 2. 虚假融合 (测试不变性) - 记得传入 labels
-            y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks,labels=label)
+            # 2. 虚假融合 / 不变性测试 (L_inv)
+            # 逻辑：保留内在因果，替换虚假背景 -> 预测应【不变】 (Label)
+            y_inv = model.prediction_spurious_fusion(x, edge_prior_mask, masks, labels=label)
             loss_inv = self.criterion(y_inv, label).mean()
 
-            # 3. 【核心修改】动态计算 Mining Ratio (课程学习)
-            # -------------------------------------------------
-            start_ratio = 0.4   # 初期：覆盖 80% (广撒网)
-            end_ratio = 0.1     # 后期：只打 10% (精细化)
+            # 3. 【新增】内在融合 / 敏感性测试 (L_sen) 
+            # 逻辑：保留虚假背景，替换内在因果 -> 预测应【翻转】 (1 - Label)
+            # -------------------------------------------------------------------------
+            y_sen = model.prediction_intrinsic_fusion(x, edge_prior_mask, masks, labels=label)
+            # 注意：目标是 (1 - label)，迫使模型意识到内在因果部分被篡改了
+            loss_sen = self.criterion(y_sen, 1 - label).mean()
+            # -------------------------------------------------------------------------
 
+            # 4. 动态计算 Mining Ratio (课程学习)
+            start_ratio = 0.4
+            end_ratio = 0.1
             current_stage_epoch = epoch - self.config['train']['pre_epoch']
             max_stage_epochs = self.config['train']['num_epoch'] - self.config['train']['pre_epoch']
-            # 防止除以0
+            
             if max_stage_epochs > 0:
                 progress = max(0, min(1, current_stage_epoch / max_stage_epochs))
             else:
                 progress = 1.0
-
             current_ratio = start_ratio - (start_ratio - end_ratio) * progress
-            # -------------------------------------------------
 
-            # 4. 【新增】原型分离损失 (替代原本的 loss_sen)
+            # 5. 原型分离损失
             loss_proto = model.compute_prototype_divergence(
                 x, masks, label, 
                 mining_ratio=current_ratio
             )
 
-            # 5. 稀疏性正则 (权重建议在 config 中降低)
+            # 6. 稀疏性正则
             mask_module = self.mask.module if isinstance(self.mask, nn.DataParallel) else self.mask
             reg_loss = mask_module.compute_sparsity_regularization(
                 lambda_reg=self.config['train']['loss_weights']['lambda_sparsity'],
                 lambda_edge_multiplier=self.config['train']['loss_weights'].get('lambda_edge_multiplier', 3.0)
             )
 
-            # 6. 组合损失
+            # 7. 组合所有损失
             loss_weights = self.config['train']['loss_weights']
-            lambda_proto = loss_weights.get('lambda_proto', 1.0) # 默认 1.0
+            lambda_proto = loss_weights.get('lambda_proto', 1.0)
 
             loss_all = (
                 loss_weights['L_inv'] * loss_inv + 
+                loss_weights.get('L_sen', 0.5) * loss_sen +  # 【新增】加入 L_sen
                 loss_weights['L_pred'] * loss_pred + 
-                lambda_proto * loss_proto +   # 新的主力约束
+                lambda_proto * loss_proto + 
                 reg_loss
             )
 
@@ -825,12 +835,14 @@ class CausalTrainer:
                 'loss': {
                     'all': loss_all,
                     'spurious_fusion': loss_inv,
+                    'intrinsic_fusion': loss_sen,  # 【新增】记录日志
                     'prototype_div': loss_proto,
                     'Intrinsic': loss_pred,
                     'sparsity_reg': reg_loss
                 },
                 'preds': {
                     'spurious_fusion': y_inv,
+                    'intrinsic_fusion': y_sen,     # 【新增】记录预测值用于计算准确率
                     'Intrinsic': y_pred
                 }
             }
@@ -886,19 +898,40 @@ class CausalTrainer:
     # ============================================================================
     # 辅助函数
     # ============================================================================
-    
     def _extract_features(self, data: torch.Tensor) -> torch.Tensor:
         """
-        使用多GPU批量提取特征（优化版 - 消除CPU瓶颈）
+        特征提取函数
+
+        [特征缓存模式] (self.use_feature_cache=True):
+            - data 已经是预计算的特征 [B, P, feature_dim]
+            - 直接移到GPU并返回，无需计算
+            - 大幅提升GPU利用率（避免实时特征提取的CPU瓶颈）
+
+        [原始模式] (self.use_feature_cache=False):
+            - data 是原始patches [B, P, 1, D, H, W]
+            - 使用冻结的DenseNet逐批提取特征
+            - GPU利用率较低（特征提取成为瓶颈）
 
         Args:
-            data: 输入数据 [B, P, 1, D, H, W]
+            data: 输入数据
+                - 特征模式: [B, P, feature_dim]
+                - 原始模式: [B, P, 1, D, H, W]
 
         Returns:
             特征张量 [B, P, feature_dim]
         """
-        B = data.shape[0]
-        total_P = data.shape[1]
+        # ============================================================
+        # [特征缓存模式] 直接使用预计算特征
+        # ============================================================
+        if self.use_feature_cache:
+            # data 已经是特征 [B, P, feature_dim]
+            # 只需要移到正确的设备
+            return data.to(self.device)
+
+        # ============================================================
+        # [原始模式] 实时提取特征（性能较低，不推荐）
+        # ============================================================
+        B, P = data.shape[0], data.shape[1]
 
         # Reshape: [B, P, 1, D, H, W] -> [B*P, 1, D, H, W]
         data_reshaped = data.view(-1, 1, data.shape[3], data.shape[4], data.shape[5])
@@ -914,7 +947,7 @@ class CausalTrainer:
                 all_features.append(features_batch)
 
         features = torch.cat(all_features, dim=0)
-        features = features.view(B, total_P, -1)
+        features = features.view(B, P, -1)
 
         return features
     
@@ -1023,7 +1056,8 @@ class CausalTrainer:
                            f"(Acc: {mask_res.get('acc_Intrinsic', 0):.2%})")
                 logger.info(f"     ├─ Spurious Fusion: {mask_res.get('spurious_fusion', 0):.4f} "
                            f"(Acc: {mask_res.get('acc_spurious_fusion', 0):.2%})")
-
+                logger.info(f"     ├─ Intrinsic Fusion (Sens): {mask_res.get('intrinsic_fusion', 0):.4f} "
+                           f"(Acc: {mask_res.get('acc_intrinsic_fusion', 0):.2%})")
                 # 【修改】新增 Prototype Div 日志打印
                 logger.info(f"     ├─ Prototype Div:   {mask_res.get('prototype_div', 0):.4f}")
 
